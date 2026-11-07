@@ -1,7 +1,2210 @@
-   <!doctype html>
-   <html><head><meta charset="utf-8"><title>Mahjong Solitaire</title></head>
-   <body style="font-family:sans-serif;max-width:40em;margin:3em auto">
-   <h1>Mahjong Solitaire</h1>
-   <p>Needs Windows with Python 3.12 and pygame (<code>py -m pip install pygame</code>).</p>
-   <p><a href="MahjongSolitaire.py" download>Download MahjongSolitaire.py</a>, then double-click it.</p>
-   </body></html>
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Mahjong Solitaire</title>
+<style>html,body{margin:0;height:100%;background:#1e2d32;overflow:hidden}canvas{display:block;touch-action:none}</style>
+</head><body><canvas id="c"></canvas>
+<script>
+'use strict';
+/* =====================================================================================================
+   Mahjong Solitaire - game logic (no drawing, no DOM): layout, free-tile rules, solvable deals, FIND,
+   matches counter, quadruples, undo, shuffle. A direct port of the Python version.
+   ===================================================================================================== */
+
+const TILE_W = 72;
+const TILE_H = 96;
+const LAYER_DX = 16;
+const LAYER_DY = 18;
+const TILE_INSET = 4;
+const MAX_IMAGES = 18;
+
+const BG_DEFAULT = 'rgb(255,255,255)';
+const BG_SELECTED = 'rgb(255,213,0)';
+const BG_MISMATCH = 'rgb(255,56,56)';
+const BG_MATCHING = 'rgb(46,214,71)';
+
+const BORDER_DEFAULT = 'rgb(150,140,120)';
+const BORDER_SELECTED = 'rgb(176,122,0)';
+const BORDER_MISMATCH = 'rgb(170,0,0)';
+const BORDER_MATCHING = 'rgb(0,128,20)';
+
+const FLASH_MISMATCH_MS = 750;
+const FLASH_MATCH_MS = 320;
+
+const TILE_TYPES = {
+  letter: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split(''),
+  digit: '0123456789'.split(''),
+};
+const KINDS = ['letter', 'digit'];
+
+const COLORS = {
+  red: [190, 40, 40],
+  green: [40, 130, 55],
+  blue: [30, 90, 190],
+  black: [50, 50, 50],
+};
+const COLOR_ORDER = ['red', 'green', 'blue', 'black'];
+
+const EDITOR_COLS = [0, 16];   // editor grid bounds (x)
+const EDITOR_ROWS = [0, 9];    // editor grid bounds (y)
+const EDITOR_MAX_LAYER = 4;
+
+function buildExactLayout() {
+  const cells = [];
+  const rows = { 1: [2, 13], 2: [4, 11], 3: [3, 12], 4: [2, 13], 5: [2, 13], 6: [3, 12], 7: [4, 11], 8: [2, 13] };
+  for (const row of Object.keys(rows)) {
+    const [c0, c1] = rows[row];
+    for (let c = c0; c <= c1; c++) cells.push([c, Number(row), 0]);
+  }
+  for (const c of [1, 14, 15]) cells.push([c, 4.5, 0]);
+  for (let r = 2; r <= 7; r++) for (let c = 5; c <= 10; c++) cells.push([c, r, 1]);
+  for (let r = 3; r <= 6; r++) for (let c = 6; c <= 9; c++) cells.push([c, r, 2]);
+  for (let r = 4; r <= 5; r++) for (let c = 7; c <= 8; c++) cells.push([c, r, 3]);
+  cells.push([7.5, 4.5, 4]);
+  if (cells.length !== 144) throw new Error('layout must have 144 tiles');
+  return cells;
+}
+const LAYOUTS = { 'Exact Turtle': buildExactLayout };
+
+/* ------------------------------------------------------------------ tile */
+class Tile {
+  constructor(gx, gy, z, kind, value, color) {
+    this.gx = +gx;
+    this.gy = +gy;
+    this.z = z | 0;
+    this.kind = kind;
+    this.value = value;
+    this.color = color;
+    this.visible = true;
+    this.selected = false;
+    this.free = false;
+    this.removing = false;          // true during the green "matched" flash
+    this.customSurface = null;
+    this.bg = BG_DEFAULT;
+    this.border = BORDER_DEFAULT;
+    this.borderWidth = 2;
+  }
+  setState(bg, border, width) { this.bg = bg; this.border = border; this.borderWidth = width; }
+  clearState() { this.setState(BG_DEFAULT, BORDER_DEFAULT, 2); }
+}
+
+/* ------------------------------------------------------------------ game core */
+class GameCore {
+  constructor(opts = {}) {
+    this.now = opts.now || (() => performance.now());
+    this.rand = opts.rand || Math.random;
+    this.WIDTH = opts.width || 1280;
+    this.HEIGHT = opts.height || 720;
+
+    this.layoutName = 'Exact Turtle';
+    this.tiles = [];
+    this.selected = null;
+    this.won = false;
+
+    this.customTs = { letter: {}, digit: {} };      // kind -> value -> { surface }
+
+    this.scale = 1;
+    this.offsetX = 0;
+    this.offsetY = 0;
+    this.originGx = 0;
+    this.originGy = 0;
+    this.boardW = 0;
+    this.boardH = 0;
+
+    this.layoutData = null;
+    this.layoutEdited = false;
+
+    this.matchHistory = [];
+    this.highlightPair = [];
+    this.findIndex = 0;
+    this.findAnchor = null;         // tile FIND is pairing others with
+    this.findLastAnchor = null;
+    this.quadValues = new Set();    // "kind|value" with all four tiles free
+    this.pending = [];
+    this.locked = false;
+
+    this.notification = null;
+    this.notificationTime = 0;
+  }
+
+  /* ---------------------------------------------------------- helpers */
+  shuffle(a) {
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(this.rand() * (i + 1));
+      const t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+    return a;
+  }
+
+  notify(message) {
+    this.notification = message;
+    this.notificationTime = this.now();
+  }
+
+  /* ---------------------------------------------------------- dealing */
+  getCells() {
+    const raw = (this.layoutEdited && this.layoutData && this.layoutData.length)
+      ? this.layoutData : LAYOUTS[this.layoutName]();
+    return raw.map(c => [+c[0], +c[1], c[2] | 0]);
+  }
+
+  makePairs(n) {
+    const base = [];
+    for (const kind of KINDS) {
+      for (const v of TILE_TYPES[kind]) {
+        base.push([[kind, v, 'red'], [kind, v, 'green']]);
+        base.push([[kind, v, 'blue'], [kind, v, 'black']]);
+      }
+    }
+    let pairs = [];
+    while (pairs.length < n) pairs = pairs.concat(this.shuffle(base.slice()));
+    return pairs.slice(0, n);
+  }
+
+  /* Give the tiles faces so the board is guaranteed solvable: simulate removing free tiles two at a time,
+     and give each removed pair one matching pair of faces. Replaying that order clears the board. */
+  dealSolvable(tiles, pairs, attempts = 300) {
+    for (let a = 0; a < attempts; a++) {
+      for (const t of tiles) t.visible = true;
+      const order = [];
+      let ok = true;
+      for (let p = 0; p < pairs.length; p++) {
+        this.updateFree();
+        const free = tiles.filter(t => t.visible && t.free);
+        if (free.length < 2) { ok = false; break; }
+        const i = Math.floor(this.rand() * free.length);
+        let j = Math.floor(this.rand() * (free.length - 1));
+        if (j >= i) j++;
+        free[i].visible = false;
+        free[j].visible = false;
+        order.push([free[i], free[j]]);
+      }
+      if (ok) {
+        for (let k = 0; k < order.length; k++) {
+          const [x, y] = order[k];
+          const [fa, fb] = pairs[k];
+          x.kind = fa[0]; x.value = fa[1]; x.color = fa[2];
+          y.kind = fb[0]; y.value = fb[1]; y.color = fb[2];
+        }
+        for (const t of tiles) t.visible = true;
+        return true;
+      }
+    }
+    for (const t of tiles) t.visible = true;
+    return false;
+  }
+
+  resetFindState() {
+    this.findIndex = 0;
+    this.findAnchor = null;
+    this.findLastAnchor = null;
+  }
+
+  applyFace(tile) {
+    const c = (this.customTs[tile.kind] || {})[tile.value];
+    tile.customSurface = c && c.surface ? c.surface : null;
+  }
+
+  newDeal() {
+    this.won = false;
+    this.selected = null;
+    this.matchHistory = [];
+    this.highlightPair = [];
+    this.resetFindState();
+    this.pending = [];
+    this.locked = false;
+    this.quadValues = new Set();
+
+    let cells = this.getCells();
+    if (cells.length % 2) {
+      cells = cells.slice(0, -1);
+      this.notify('Layout had an odd tile count - one tile dropped');
+    }
+    if (cells.length < 2) {
+      this.tiles = [];
+      this.notify('Layout has too few tiles');
+      return;
+    }
+
+    this.tiles = cells.map(([gx, gy, z]) => new Tile(gx, gy, z, 'letter', 'A', 'red'));
+    const pairs = this.makePairs(cells.length / 2);
+
+    if (!this.dealSolvable(this.tiles, pairs)) {
+      const faces = [].concat(...pairs.map(p => [p[0], p[1]]));
+      this.shuffle(faces);
+      this.tiles.forEach((t, i) => { [t.kind, t.value, t.color] = faces[i]; });
+      this.notify('Could not guarantee a solvable deal - dealt randomly');
+    }
+
+    for (const t of this.tiles) {
+      t.visible = true;
+      t.clearState();
+      this.applyFace(t);
+    }
+
+    this.recalculateView();
+    this.updateFree();
+    this.refreshQuads();
+  }
+
+  /* ---------------------------------------------------------- geometry */
+  setView(minGx, maxGx, minGy, maxGy, maxZ) {
+    const boardW = (maxGx - minGx + 1) * TILE_W + maxZ * LAYER_DX;
+    const boardH = (maxGy - minGy + 1) * TILE_H + maxZ * LAYER_DY;
+    const topMargin = 115;
+    const bottomMargin = 135;
+    const availW = this.WIDTH - 100;
+    const availH = this.HEIGHT - topMargin - bottomMargin;
+    this.scale = Math.min(1.0, availW / boardW, availH / boardH);
+    this.boardW = boardW * this.scale;
+    this.boardH = boardH * this.scale;
+    this.originGx = minGx;
+    this.originGy = minGy;
+    this.offsetX = (this.WIDTH - this.boardW) / 2;
+    this.offsetY = topMargin + (availH - this.boardH) / 2;
+  }
+
+  recalculateView() {
+    let cells = this.tiles.map(t => [t.gx, t.gy, t.z]);
+    if (!cells.length) cells = this.getCells();
+    if (!cells.length) return;
+    this.setView(Math.min(...cells.map(c => c[0])), Math.max(...cells.map(c => c[0])),
+                 Math.min(...cells.map(c => c[1])), Math.max(...cells.map(c => c[1])),
+                 Math.max(...cells.map(c => c[2])));
+  }
+
+  cellRect(gx, gy, z) {
+    const s = this.scale;
+    const x = this.offsetX + (gx - this.originGx) * TILE_W * s + z * LAYER_DX * s;
+    const y = this.offsetY + (gy - this.originGy) * TILE_H * s - z * LAYER_DY * s;
+    return { x: Math.trunc(x), y: Math.trunc(y),
+             w: Math.trunc((TILE_W - TILE_INSET) * s), h: Math.trunc((TILE_H - TILE_INSET) * s) };
+  }
+
+  tileRect(t) { return this.cellRect(t.gx, t.gy, t.z); }
+
+  tileAt(px, py) {
+    const order = this.tiles.slice().sort((a, b) => (b.z - a.z) || (b.gy - a.gy) || (b.gx - a.gx));
+    for (const t of order) {
+      if (!t.visible) continue;
+      const r = this.tileRect(t);
+      if (px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h) return t;
+    }
+    return null;
+  }
+
+  /* ---------------------------------------------------------- rules */
+  /* A tile is free if nothing sits on top of it AND it is not blocked on both its left and right.
+     Positions are compared in half-cell units so the half-row side tiles (the turtle's "ears") block
+     correctly. */
+  updateFree() {
+    const key = (z, kx, ky) => ((z + 8) * 1024 + (kx + 512)) * 1024 + (ky + 512);
+    const occ = new Set();
+    let maxZ = 0;
+    for (const t of this.tiles) {
+      if (t.visible) {
+        occ.add(key(t.z, Math.round(t.gx * 2), Math.round(t.gy * 2)));
+        if (t.z > maxZ) maxZ = t.z;
+      }
+    }
+    for (const t of this.tiles) {
+      if (!t.visible) { t.free = false; continue; }
+      const kx = Math.round(t.gx * 2);
+      const ky = Math.round(t.gy * 2);
+      let covered = false;
+      for (let z = t.z + 1; z <= maxZ && !covered; z++) {
+        for (let dx = -1; dx <= 1 && !covered; dx++) {
+          for (let dy = -1; dy <= 1; dy++) {
+            if (occ.has(key(z, kx + dx, ky + dy))) { covered = true; break; }
+          }
+        }
+      }
+      if (covered) { t.free = false; continue; }
+      let left = false, right = false;
+      for (let dy = -1; dy <= 1; dy++) {
+        if (occ.has(key(t.z, kx - 2, ky + dy))) left = true;
+        if (occ.has(key(t.z, kx + 2, ky + dy))) right = true;
+      }
+      t.free = !(left && right);
+    }
+  }
+
+  canMatch(a, b) {
+    if (a === b) return false;
+    return a.kind === b.kind && a.value === b.value;
+  }
+
+  freeTiles() { return this.tiles.filter(t => t.visible && t.free); }
+
+  allPairs() {
+    const free = this.freeTiles();
+    const out = [];
+    for (let i = 0; i < free.length; i++) {
+      for (let j = i + 1; j < free.length; j++) {
+        if (this.canMatch(free[i], free[j])) out.push([free[i], free[j]]);
+      }
+    }
+    return out;
+  }
+
+  findPair() {
+    const free = this.freeTiles();
+    for (let i = 0; i < free.length; i++) {
+      for (let j = i + 1; j < free.length; j++) {
+        if (this.canMatch(free[i], free[j])) return [free[i], free[j]];
+      }
+    }
+    return null;
+  }
+
+  /* Number of distinct matching pairs among the free tiles right now - exactly the number of presses FIND
+     needs to cycle through every match and come back to the first one (4 free copies = 6 pairs).
+     Tiles already matched and mid-flash ("removing") are not counted. */
+  countMoves() {
+    const groups = new Map();
+    for (const t of this.tiles) {
+      if (t.visible && t.free && !t.removing) {
+        const k = t.kind + '|' + t.value;
+        groups.set(k, (groups.get(k) || 0) + 1);
+      }
+    }
+    let total = 0;
+    for (const n of groups.values()) total += n * (n - 1) / 2;
+    return total;
+  }
+
+  /* Face values whose four tiles are ALL free right now. */
+  quadSet() {
+    const groups = new Map();
+    for (const t of this.tiles) {
+      if (t.visible && t.free && !t.removing) {
+        const k = t.kind + '|' + t.value;
+        groups.set(k, (groups.get(k) || 0) + 1);
+      }
+    }
+    const out = new Set();
+    for (const [k, n] of groups) if (n >= 4) out.add(k);
+    return out;
+  }
+
+  refreshQuads() { this.quadValues = this.quadSet(); }
+
+  /* ---------------------------------------------------------- scheduling */
+  schedule(delayMs, fn) { this.pending.push([this.now() + delayMs, fn]); }
+
+  processPending() {
+    if (!this.pending.length) return;
+    const now = this.now();
+    const due = this.pending.filter(it => it[0] <= now);
+    this.pending = this.pending.filter(it => it[0] > now);
+    for (const it of due) it[1]();
+  }
+
+  /* ---------------------------------------------------------- actions */
+  clearSelection() {
+    if (this.selected) {
+      this.selected.selected = false;
+      this.selected.clearState();
+      this.selected = null;
+    }
+  }
+
+  clearHighlight() {
+    for (const t of this.highlightPair) { t.selected = false; t.clearState(); }
+    this.highlightPair = [];
+  }
+
+  /* FIND with a tile selected: highlight that tile plus a free match for it (press again to cycle through
+     its other free matches). FIND with nothing selected: highlight a matching pair (press again for the
+     next one). Click a highlighted tile to remove the pair. */
+  findMove() {
+    if (this.locked || !this.canPlay()) return;
+
+    let anchor = this.selected;
+    const fromSelection = anchor !== null;
+    if (anchor === null && this.findAnchor !== null && this.highlightPair.includes(this.findAnchor)) {
+      anchor = this.findAnchor;           // keep cycling around the same tile
+    }
+
+    this.clearHighlight();                // old yellow tiles go back to white
+    if (fromSelection) {
+      anchor.selected = false;
+      anchor.clearState();
+      this.selected = null;
+    }
+
+    let pair, message;
+    if (anchor !== null) {
+      const partners = this.freeTiles().filter(t => this.canMatch(anchor, t));
+      if (!partners.length) {
+        // Nothing to pair with: the tile is deselected and flashes red, then goes back to plain white.
+        this.findAnchor = null;
+        anchor.selected = false;
+        anchor.setState(BG_MISMATCH, BORDER_MISMATCH, 4);
+        const restore = () => {
+          if (anchor.visible && anchor.bg === BG_MISMATCH && anchor !== this.selected) anchor.clearState();
+        };
+        this.schedule(FLASH_MISMATCH_MS, restore);
+        this.notify('No free match for ' + anchor.value + ' right now');
+        return;
+      }
+      if (anchor !== this.findLastAnchor) this.findIndex = 0;
+      this.findLastAnchor = anchor;
+      this.findAnchor = anchor;
+      const pos = this.findIndex % partners.length;
+      pair = [anchor, partners[pos]];
+      message = 'Match for ' + anchor.value + ' highlighted (option ' + (pos + 1) + ' of ' +
+                partners.length + ') - click to remove';
+    } else {
+      const pairs = this.allPairs();
+      if (!pairs.length) { this.notify('No moves left - try SHUFFLE'); return; }
+      if (this.findLastAnchor !== null) this.findIndex = 0;
+      this.findLastAnchor = null;
+      this.findAnchor = null;
+      pair = pairs[this.findIndex % pairs.length];
+      message = 'Match highlighted - click one of them to remove';
+    }
+
+    this.findIndex += 1;
+    for (const t of pair) { t.selected = true; t.setState(BG_SELECTED, BORDER_SELECTED, 4); }
+    this.highlightPair = pair.slice();
+    this.notify(message);
+  }
+
+  undoMove() {
+    if (this.locked || !this.canPlay()) return;
+    if (!this.matchHistory.length) { this.notify('Nothing to undo'); return; }
+    this.clearSelection();
+    this.clearHighlight();
+    for (const t of this.matchHistory.pop()) {
+      t.visible = true;
+      t.selected = false;
+      t.removing = false;
+      t.clearState();
+    }
+    this.won = false;
+    this.resetFindState();
+    this.updateFree();
+    this.refreshQuads();
+    this.notify('Undone');
+  }
+
+  reshuffle() {
+    if (this.locked || !this.canPlay()) return;
+    this.clearSelection();
+    this.clearHighlight();
+
+    const visible = this.tiles.filter(t => t.visible);
+    if (visible.length < 2) { this.notify('Not enough tiles to shuffle'); return; }
+
+    // Rebuild matching pairs from the faces still on the board.
+    const groups = new Map();
+    for (const t of visible) {
+      const k = t.kind + '|' + t.value;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push([t.kind, t.value, t.color]);
+    }
+    const pairs = [];
+    const leftovers = [];
+    for (const faces of groups.values()) {
+      this.shuffle(faces);
+      while (faces.length >= 2) pairs.push([faces.pop(), faces.pop()]);
+      leftovers.push(...faces);
+    }
+
+    let done = false;
+    if (!leftovers.length) done = this.dealSolvable(visible, pairs, 200);
+
+    if (!done) {
+      const faces = visible.map(t => [t.kind, t.value, t.color]);
+      for (let i = 0; i < 200; i++) {
+        this.shuffle(faces);
+        visible.forEach((t, j) => { [t.kind, t.value, t.color] = faces[j]; });
+        this.updateFree();
+        if (this.findPair() !== null) { done = true; break; }
+      }
+    }
+
+    for (const t of visible) { t.visible = true; this.applyFace(t); }
+
+    this.resetFindState();
+    this.updateFree();
+    this.refreshQuads();
+    this.notify(done ? 'Shuffled' : 'Shuffled - no matching moves possible');
+  }
+
+  finishMatch(t1, t2) {
+    this.matchHistory.push([t1, t2]);
+    for (const t of [t1, t2]) {
+      t.visible = false;
+      t.selected = false;
+      t.removing = false;
+      t.clearState();
+    }
+    this.locked = false;
+    this.resetFindState();
+
+    this.updateFree();
+    this.refreshQuads();
+
+    if (!this.tiles.some(t => t.visible)) {
+      this.won = true;
+      this.notify('Board cleared!');
+    } else if (this.findPair() === null) {
+      this.notify('No moves left - use UNDO or SHUFFLE');
+    }
+  }
+
+  flashMismatch(t1, t2) {
+    for (const t of [t1, t2]) {
+      t.selected = false;
+      t.setState(BG_MISMATCH, BORDER_MISMATCH, 4);
+    }
+    this.locked = true;
+    this.schedule(FLASH_MISMATCH_MS, () => {
+      for (const t of [t1, t2]) t.clearState();
+      this.locked = false;
+    });
+  }
+
+  /* ---------------------------------------------------------- clicking */
+  clickTile(tile) {
+    if (this.locked) return;
+
+    // Clicking a FIND-highlighted tile removes the highlighted pair.
+    if (this.highlightPair.includes(tile)) {
+      const other = this.highlightPair[0] === tile ? this.highlightPair[1] : this.highlightPair[0];
+      this.clearHighlight();
+      this.finishMatch(tile, other);
+      return;
+    }
+
+    // Clicking anything else clears the highlight (tiles go white).
+    if (this.highlightPair.length) this.clearHighlight();
+
+    if (!tile.free) { this.notify('That tile is blocked.'); return; }
+
+    if (this.selected === tile) {
+      tile.selected = false;
+      tile.clearState();
+      this.selected = null;
+      return;
+    }
+
+    if (this.selected === null) {
+      tile.selected = true;
+      tile.setState(BG_SELECTED, BORDER_SELECTED, 4);
+      this.selected = tile;
+      return;
+    }
+
+    const first = this.selected;
+    if (this.canMatch(first, tile)) {
+      first.selected = false;
+      first.removing = true;
+      tile.removing = true;
+      first.setState(BG_MATCHING, BORDER_MATCHING, 4);
+      tile.setState(BG_MATCHING, BORDER_MATCHING, 4);
+      this.selected = null;
+      this.locked = true;
+      this.schedule(FLASH_MATCH_MS, () => this.finishMatch(first, tile));
+    } else {
+      this.selected = null;
+      this.flashMismatch(first, tile);
+    }
+  }
+
+  /* The UI overrides this: game actions only work on the game screen. */
+  canPlay() { return true; }
+}
+
+if (typeof module !== 'undefined') {
+  module.exports = { GameCore, Tile, buildExactLayout, LAYOUTS, TILE_TYPES, KINDS, COLORS, COLOR_ORDER,
+                     BG_DEFAULT, BG_SELECTED, BG_MISMATCH, BG_MATCHING, FLASH_MATCH_MS, FLASH_MISMATCH_MS,
+                     TILE_W, TILE_H, TILE_INSET, EDITOR_COLS, EDITOR_ROWS, EDITOR_MAX_LAYER, MAX_IMAGES };
+}
+'use strict';
+/* =====================================================================================================
+   AMBIENT MUSIC (from Rainbow Runner): a never-ending, randomly composed sequence on the five black keys
+   of a piano. Everything is synthesised here (no sound files). A direct port of the Python engine:
+     - MusicCommon():  the shared engine code (settings, note synthesis, composer, mixer, effects)
+     - a Web Worker builds the notes in the background,
+     - an AudioWorklet composes, mixes and applies phaser / flanger / echo / reverb in real time,
+     - MusicPlayer is what the game talks to (same API as the Python AmbientMusic).
+   MusicCommon is a self-contained function so its source can be copied into the worker and the worklet.
+   ===================================================================================================== */
+
+function MusicCommon() {
+  const MUS_RATE = 22050;                     // samples per second (the engine always runs at this rate)
+  const MUS_N = 512;                          // frames per processing block (23 ms)
+  const MUS_INSTRUMENTS = ['Piano', 'Koto', 'Steel drum', 'Kalimba'];
+  const MUS_DEFAULTS = { on: true, inst: 'Piano', oct_lo: 2, oct_n: 4, density: 10, long: 3, voices: 4, vol: 7,
+                         rev_mix: 8, rev_len: 8, dly_mix: 4, dly_time: 7, pha_mix: 9, pha_rate: 8,
+                         fla_mix: 10, fla_rate: 8 };
+  const MUS_LIMITS = { oct_lo: [1, 6], oct_n: [1, 4], density: [1, 15], long: [0, 10], voices: [1, 4],
+                       vol: [0, 10], rev_mix: [0, 10], rev_len: [1, 10], dly_mix: [0, 10], dly_time: [1, 10],
+                       pha_mix: [0, 10], pha_rate: [1, 10], fla_mix: [0, 10], fla_rate: [1, 10] };
+  const BLACK_PCS = [1, 3, 6, 8, 10];         // C#  D#  F#  G#  A#
+  const NOTE_NAMES = { 1: 'C#', 3: 'D#', 6: 'F#', 8: 'G#', 10: 'A#' };
+
+  /* A complete, valid settings object from whatever was saved. */
+  function musicClean(d) {
+    const out = Object.assign({}, MUS_DEFAULTS);
+    if (d && typeof d === 'object') {
+      for (const k of Object.keys(d)) {
+        const v = d[k];
+        if (k === 'on') out.on = !!v;
+        else if (k === 'inst' && MUS_INSTRUMENTS.indexOf(v) >= 0) out.inst = v;
+        else if (Object.prototype.hasOwnProperty.call(MUS_LIMITS, k) && typeof v === 'number' && isFinite(v)) {
+          out[k] = Math.max(MUS_LIMITS[k][0], Math.min(MUS_LIMITS[k][1], Math.trunc(v)));
+        }
+      }
+    }
+    out.oct_lo = Math.min(out.oct_lo, 7 - out.oct_n);
+    return out;
+  }
+
+  /* Every black-key MIDI note inside the chosen octave range, low to high. */
+  function musicPitches(p) {
+    const out = [];
+    for (let o = p.oct_lo; o < p.oct_lo + p.oct_n; o++) for (const pc of BLACK_PCS) out.push(12 * (o + 1) + pc);
+    return out;
+  }
+
+  function musicNoteName(m) { return (NOTE_NAMES[m % 12] || '?') + (Math.floor(m / 12) - 1); }
+
+  function mulberry32(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /* ---------------------------------------------------------------- note synthesis */
+  /* A grand piano note, added into buf. What makes it a piano and not a keyboard: every partial is slightly
+     stretched (stiff strings), every partial is TWO strings tuned a fraction of a cent apart (they beat and
+     shimmer), the sound dies in two stages (a quick "prompt" fall, then a long "after-ring"), higher
+     partials die sooner, the hammer strikes a point on the string (some partials are weak), and the felt
+     hammer adds a soft thump at the start. */
+  function grandPiano(buf, f, midi, ls) {
+    const n = buf.length;
+    const rnd = mulberry32(midi * 7 + 1);
+    const uni = (a, b) => a + (b - a) * rnd();
+    const R = MUS_RATE;
+    const twoPi = 2.0 * Math.PI;
+    const bigB = 0.00012 * Math.exp((midi - 48) / 16.0);                    // string stiffness: stretched partials
+    const tau1 = Math.max(0.35, Math.min(4.0, 1.7 * Math.pow(261.6 / f, 0.55))) * ls;   // low notes ring longer
+    for (let k = 1; k <= 18; k++) {
+      const fk = k * f * Math.sqrt(1.0 + bigB * k * k);
+      if (fk > R * 0.45) break;
+      const amp = Math.abs(Math.sin(Math.PI * k * 0.12)) / Math.pow(k, 0.75) * Math.exp(-(k - 1) * 0.11);
+      if (amp < 0.004) continue;
+      const t1 = tau1 / (1.0 + 0.35 * Math.pow(k - 1, 1.1));
+      const t2 = t1 * 4.5;
+      const m = Math.min(n, Math.floor(R * t2 * 6.0));
+      const d1 = Math.exp(-1.0 / (R * t1));
+      const d2 = Math.exp(-1.0 / (R * t2));
+      const cents = uni(0.3, 0.9) / 1200.0 * Math.log(2.0);
+      const wa = twoPi * fk * (1.0 + cents) / R;
+      const wb = twoPi * fk * (1.0 - cents) / R;
+      const pa = uni(0, twoPi);
+      const pb = uni(0, twoPi);
+      let e1 = 0.6 * amp * 0.5;
+      let e2 = 0.4 * amp * 0.5;
+      // two sine oscillators by rotation (much cheaper than a sin() per sample)
+      const ca = Math.cos(wa), sa = Math.sin(wa), cb = Math.cos(wb), sb = Math.sin(wb);
+      let xa = Math.cos(pa), ya = Math.sin(pa), xb = Math.cos(pb), yb = Math.sin(pb);
+      for (let i = 0; i < m; i++) {
+        buf[i] += (e1 + e2) * (ya + yb);
+        let t = xa * ca - ya * sa; ya = xa * sa + ya * ca; xa = t;
+        t = xb * cb - yb * sb; yb = xb * sb + yb * cb; xb = t;
+        e1 *= d1;
+        e2 *= d2;
+        if (e1 + e2 < 1e-7) break;                                          // inaudible from here on
+      }
+    }
+    let lp = 0.0;                                                           // the hammer's felt thump
+    const a = Math.min(0.9, 2.0 * Math.PI * Math.min(2500.0, f * 3.0) / R);
+    const lim = Math.floor(0.06 * R);
+    for (let i = 0; i < lim; i++) {
+      lp += a * (uni(-1.0, 1.0) - lp);
+      buf[i] += 0.55 * lp * Math.exp(-i / (0.008 * R));
+    }
+  }
+
+  /* One note of an instrument as mono floats (peak 0.8). Additive synthesis: a handful of partials, each
+     with its own decay; `long` stretches every decay so the note rings on. */
+  function synthNote(inst, midi, long) {
+    const R = MUS_RATE;
+    const f = 440.0 * Math.pow(2.0, (midi - 69) / 12.0);
+    const secs = long ? 10.0 : 7.0;
+    const n = Math.floor(R * secs);
+    const ls = long ? 2.6 : 1.0;
+    const tl = Math.max(0.55, Math.min(1.6, Math.pow(261.6 / f, 0.35)));    // low notes ring longer
+    let bend = 0.0;
+    let parts = [];
+    if (inst === 'Koto') {
+      for (let k = 1; k <= 8; k++) parts.push([k, 1.0 / Math.pow(k, 0.8), 2.0 * tl / Math.pow(k, 0.75)]);
+      parts.push([1.004, 0.25, 1.4 * tl]);                                  // a faint second string: slight shimmer
+      bend = 0.011;
+    } else if (inst === 'Steel drum') {
+      parts = [[1.0, 1.0, 2.4 * tl], [1.003, 0.45, 2.1 * tl], [2.0, 0.75, 1.7 * tl], [3.0, 0.38, 1.0 * tl],
+               [4.01, 0.20, 0.6 * tl], [5.98, 0.08, 0.35 * tl], [2.76, 0.12, 0.18 * tl]];
+    } else if (inst !== 'Piano') {                                          // Kalimba
+      parts = [[1.0, 1.0, 2.6 * tl], [2.0, 0.16, 1.1 * tl], [5.4, 0.30, 0.24 * tl], [8.9, 0.09, 0.10 * tl]];
+    }
+    const buf = new Float64Array(n);
+    const twoPi = 2.0 * Math.PI;
+    if (inst === 'Piano') grandPiano(buf, f, midi, ls);
+    for (const [ratio, amp, tau0] of parts) {
+      const fr = f * ratio;
+      if (fr > R * 0.45) continue;
+      const tau = tau0 * ls;
+      const m = Math.min(n, Math.floor(R * tau * 7.0));
+      const dec = Math.exp(-1.0 / (R * tau));
+      const w = twoPi * fr / R;
+      let e = amp;
+      if (bend) {
+        const tb = 0.06 * R;
+        for (let i = 0; i < m; i++) {
+          buf[i] += e * Math.sin(w * (i + bend * tb * (1.0 - Math.exp(-i / tb))));
+          e *= dec;
+        }
+      } else {
+        for (let i = 0; i < m; i++) {
+          buf[i] += e * Math.sin(w * i);
+          e *= dec;
+        }
+      }
+    }
+    for (let i = 0; i < 80; i++) buf[i] *= i / 80.0;                        // a soft attack: no click
+    let peak = 0;
+    for (let i = 0; i < n; i++) { const a = Math.abs(buf[i]); if (a > peak) peak = a; }
+    if (!peak) peak = 1.0;
+    const k = 0.8 / peak;
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = buf[i] * k;
+    return out;
+  }
+
+  const noteKey = (inst, midi, long) => inst + '|' + midi + '|' + (long ? 1 : 0);
+  const clamp1 = (v) => (v > 1 ? 1 : (v < -1 ? -1 : v));
+
+  /* ---------------------------------------------------------------- the player's engine */
+  /* Composes notes, mixes up to four voices and runs them through phaser, flanger, echo and reverb.
+     block() makes 23 ms of stereo audio (512 frames at 22050 Hz). */
+  class AmbientEngine {
+    constructor(settings, rng) {
+      this.p = musicClean(settings);
+      this.rng = rng || Math.random;
+      this.notes = new Map();
+      this.voices = [];
+      this.t = 0;                                         // frames rendered so far
+      this.nextOn = Math.trunc(0.6 * MUS_RATE);
+      this.recent = [];                                   // the last pitches played
+      this.tri = [];                                      // recent three-note shapes
+      this.ivs = [];                                      // recent intervals
+      this.reg = {};                                      // how often each octave was used lately
+      this.fade = 0.0;
+      this.L = new Float32Array(MUS_N);
+      this.R = new Float32Array(MUS_N);
+      // effect state
+      this.phaPh = 0.0;
+      this.phaSt = [new Float64Array(8), new Float64Array(8)];
+      this.flaPh = 0.0;
+      this.dryL = new Float32Array(2048);
+      this.dryR = new Float32Array(2048);
+      this.dryN = 0;
+      this.echoBuf = new Float32Array(65536);
+      this.echoN = 0;
+      this.combs = [0, 1].map(() => this.COMB_MS[0].map(() => new Float32Array(4096)));
+      this.combN = 0;
+      this.COMB_MS_USE = this.COMB_MS;
+    }
+
+    get COMB_MS() { return [[24.1, 29.7, 37.1, 41.1, 47.3, 53.9], [25.3, 31.9, 35.3, 43.3, 49.9, 57.1]]; }
+
+    addNote(inst, midi, long, data) { this.notes.set(noteKey(inst, midi, long), data); }
+    getNote(inst, midi, long) { return this.notes.get(noteKey(inst, midi, long)); }
+    forget(keepInst) { for (const k of Array.from(this.notes.keys())) if (k.split('|')[0] !== keepInst) this.notes.delete(k); }
+    reset() { this.voices = []; this.fade = 0.0; }
+
+    /* ----- composing ----- */
+    choices(cands, weights) {
+      let total = 0;
+      for (const w of weights) total += w;
+      let r = this.rng() * total;
+      for (let i = 0; i < cands.length; i++) { r -= weights[i]; if (r < 0) return cands[i]; }
+      return cands[cands.length - 1];
+    }
+
+    /* Pick the next pitch: black keys only, not a recent note, spread away from the notes already sounding,
+       and never a shape (three notes in a row) that was heard a moment ago. */
+    choose() {
+      const p = this.p;
+      const pits = musicPitches(p).filter(m => this.getNote(p.inst, m, false) !== undefined);
+      if (!pits.length) return null;
+      const sounding = this.voices.map(v => v.midi);
+      const last = this.recent;
+      let cands = [], weights = [];
+      for (const m of pits) {
+        if (last.slice(-4).indexOf(m) >= 0) continue;
+        if (last.length && m % 12 === last[last.length - 1] % 12) continue;           // same key, other octave: too alike
+        if (last.slice(-5).filter(x => x % 12 === m % 12).length >= 2) continue;
+        if (last.length >= 2 && this.tri.some(t => t[0] === last[last.length - 2] && t[1] === last[last.length - 1] && t[2] === m)) continue;
+        if (last.length >= 2 && this.ivs.length >= 2 && m - last[last.length - 1] === this.ivs[this.ivs.length - 1] &&
+            this.ivs[this.ivs.length - 1] === this.ivs[this.ivs.length - 2]) continue;   // no endless ladders
+        let w = 1.0;
+        if (sounding.length) {
+          const d = Math.min(...sounding.map(s => Math.abs(m - s)));
+          w *= d < 3 ? 0.08 : (d < 6 ? 0.5 : 1.0);                                   // keep the voices spread out
+        }
+        w *= 1.0 / (1.0 + (this.reg[Math.floor(m / 12)] || 0.0));                    // visit every octave
+        if (last.length) w *= Math.abs(m - last[last.length - 1]) <= 9 ? 1.0 : 0.6;
+        cands.push(m);
+        weights.push(w);
+      }
+      if (!cands.length) {
+        const c = pits.filter(m => last.slice(-2).indexOf(m) < 0);
+        cands = c.length ? c : pits;
+        weights = cands.map(() => 1.0);
+      }
+      const m = this.choices(cands, weights);
+      if (last.length) {
+        this.ivs.push(m - last[last.length - 1]);
+        if (this.ivs.length > 6) this.ivs.splice(0, this.ivs.length - 6);
+      }
+      if (last.length >= 2) {
+        this.tri.push([last[last.length - 2], last[last.length - 1], m]);
+        if (this.tri.length > 24) this.tri.splice(0, this.tri.length - 24);
+      }
+      last.push(m);
+      if (last.length > 12) last.splice(0, last.length - 12);
+      for (const k of Object.keys(this.reg)) this.reg[k] *= 0.9;
+      const oc = Math.floor(m / 12);
+      this.reg[oc] = (this.reg[oc] || 0.0) + 1.0;
+      return m;
+    }
+
+    /* Average seconds between notes: 9 s at density 1 down to 0.28 s (3.6 notes a second) at 15. */
+    meanGap() { return 9.0 * Math.pow(0.78, this.p.density - 1); }
+
+    gap() {
+      const mean = this.meanGap();
+      let g = mean * (0.35 + Math.min(3.0, -Math.log(1.0 - this.rng())) * 0.65);
+      if (this.rng() < 0.10) g *= 0.3;
+      return Math.max(0.12, g);
+    }
+
+    spawn() {
+      const p = this.p, rng = this.rng;
+      if (this.voices.length >= p.voices) return false;
+      const m = this.choose();
+      if (m === null) return false;
+      let long = rng() < p.long * 0.1;
+      let data = this.getNote(p.inst, m, long);
+      if (data === undefined) {
+        long = false;
+        data = this.getNote(p.inst, m, false);
+        if (data === undefined) return false;
+      }
+      let sf = Math.max(0.15, Math.min(1.0, 0.2 * this.meanGap() * p.voices));      // busy music: shorter notes
+      let hold, fade;
+      if (long) {
+        sf = Math.max(sf, 0.35);
+        hold = (6.0 + 2.0 * rng()) * sf; fade = (2.0 + 0.8 * rng()) * sf;
+      } else {
+        hold = (1.6 + 2.6 * rng()) * sf; fade = (1.0 + 0.8 * rng()) * sf;
+      }
+      const pits = musicPitches(p);
+      const pos = (m - pits[0]) / Math.max(1, pits[pits.length - 1] - pits[0]);
+      const pan = Math.max(-0.85, Math.min(0.85, (pos - 0.5) * 0.9 + (-0.3 + 0.6 * rng())));
+      const vel = (0.55 + 0.45 * rng()) * (long ? 0.85 : 1.0);
+      this.voices.push({ midi: m, buf: data, pos: 0, hold: Math.trunc(hold * MUS_RATE), fade: Math.trunc(fade * MUS_RATE),
+                         gl: vel * Math.sqrt((1.0 - pan) / 2.0), gr: vel * Math.sqrt((1.0 + pan) / 2.0) });
+      return true;
+    }
+
+    /* ----- rendering ----- */
+    voicesBlock(L, R) {
+      const N = MUS_N;
+      L.fill(0); R.fill(0);
+      const keep = [];
+      for (const v of this.voices) {
+        const a = v.pos;
+        const buf = v.buf;
+        const len = buf.length;
+        for (let s = 0; s < 4; s++) {
+          const fr = a + s * 128 + 64;
+          let g;
+          if (fr <= v.hold) g = 1.0;
+          else { const x = (fr - v.hold) / v.fade; g = Math.pow(Math.max(0.0, 1.0 - x), 1.5); }
+          const fac = g * 0.34;
+          for (let j = 0; j < 128; j++) {
+            const idx = a + s * 128 + j;
+            if (idx >= len) break;
+            const m = buf[idx] * fac;
+            L[s * 128 + j] += m * v.gl;
+            R[s * 128 + j] += m * v.gr;
+          }
+        }
+        v.pos = a + N;
+        if (v.pos < Math.min(v.hold + v.fade, len)) keep.push(v);
+      }
+      this.voices = keep;
+      for (let i = 0; i < N; i++) { L[i] = clamp1(L[i]); R[i] = clamp1(R[i]); }
+    }
+
+    phaser(L, R, mix) {
+      const N = MUS_N;
+      const m = mix * 0.1 * 0.6;
+      const rate = 0.05 + 0.09 * this.p.pha_rate;
+      this.phaPh += 2.0 * Math.PI * rate * N / MUS_RATE;
+      const keep = 1.0 - m;
+      [L, R].forEach((a, ch) => {
+        const lf = 0.5 + 0.5 * Math.sin(this.phaPh + ch * 1.4);
+        const fc = 250.0 + 1700.0 * lf * lf;
+        const tn = Math.tan(Math.PI * fc / MUS_RATE);
+        const c = (tn - 1.0) / (tn + 1.0);
+        const st = this.phaSt[ch];
+        let x1 = st[0], y1 = st[1], x2 = st[2], y2 = st[3], x3 = st[4], y3 = st[5], x4 = st[6], y4 = st[7];
+        for (let i = 0; i < N; i++) {
+          const s = a[i];
+          let y = c * s + x1 - c * y1;
+          x1 = s; y1 = y;
+          let z = c * y + x2 - c * y2;
+          x2 = y; y2 = z;
+          y = c * z + x3 - c * y3;
+          x3 = z; y3 = y;
+          z = c * y + x4 - c * y4;
+          x4 = y; y4 = z;
+          a[i] = clamp1(s * keep + z * m);
+        }
+        st[0] = x1; st[1] = y1; st[2] = x2; st[3] = y2; st[4] = x3; st[5] = y3; st[6] = x4; st[7] = y4;
+      });
+    }
+
+    pushDry(L, R) {
+      const M = 2047;
+      for (let i = 0; i < MUS_N; i++) { this.dryL[(this.dryN + i) & M] = L[i]; this.dryR[(this.dryN + i) & M] = R[i]; }
+    }
+
+    flanger(L, R, mix) {
+      const N = MUS_N;
+      this.flaPh += 2.0 * Math.PI * (0.04 + 0.05 * this.p.fla_rate) * N / MUS_RATE;
+      const d = Math.trunc(MUS_RATE * (0.0018 + 0.0014 * Math.sin(this.flaPh)));    // 0.4 .. 3.2 ms
+      this.pushDry(L, R);                                                           // the dry signal, incl. this block
+      const M = 2047;
+      const k = mix * 0.1 * 0.45;
+      const n0 = this.dryN;
+      for (let i = 0; i < N; i++) {
+        const j = (n0 + i - d) & M;
+        L[i] = clamp1(L[i] * (1.0 - k * 0.5) + this.dryL[j] * k);
+        R[i] = clamp1(R[i] * (1.0 - k * 0.5) + this.dryR[j] * k);
+      }
+    }
+
+    echo(L, R, mix) {
+      const N = MUS_N, M = 65535;
+      const dl = Math.max(N + 16, Math.trunc(MUS_RATE * (0.12 + 0.075 * this.p.dly_time)));
+      const dl2 = Math.trunc(dl * 1.5);
+      const n0 = this.echoN;
+      const k = mix * 0.1 * 0.8;
+      const t1 = new Float32Array(N), t2 = new Float32Array(N);
+      for (let i = 0; i < N; i++) { t1[i] = this.echoBuf[(n0 + i - dl) & M]; t2[i] = this.echoBuf[(n0 + i - dl2) & M]; }
+      for (let i = 0; i < N; i++) {
+        const mono = 0.5 * L[i] + 0.5 * R[i];
+        this.echoBuf[(n0 + i) & M] = clamp1(mono + t1[i] * 0.42);
+        L[i] = clamp1(L[i] + t1[i] * k);
+        R[i] = clamp1(R[i] + t2[i] * k);
+      }
+      this.echoN += N;
+    }
+
+    pushEchoMono(L, R) {
+      const N = MUS_N, M = 65535;
+      for (let i = 0; i < N; i++) this.echoBuf[(this.echoN + i) & M] = 0.5 * L[i] + 0.5 * R[i];
+      this.echoN += N;
+    }
+
+    reverb(L, R, mix) {
+      const N = MUS_N, M = 4095;
+      const g = 0.62 + 0.032 * this.p.rev_len;                                      // feedback: 0.65 .. 0.94
+      const n0 = this.combN;
+      const mono = new Float32Array(N);
+      for (let i = 0; i < N; i++) mono[i] = 0.5 * L[i] + 0.5 * R[i];
+      const outs = [new Float32Array(N), new Float32Array(N)];
+      for (let side = 0; side < 2; side++) {
+        const delays = this.COMB_MS[side];
+        for (let j = 0; j < delays.length; j++) {
+          const dl = Math.trunc(MUS_RATE * delays[j] / 1000.0);
+          const ring = this.combs[side][j];
+          const acc = outs[side];
+          for (let i = 0; i < N; i++) {
+            const lp = 0.5 * ring[(n0 + i - dl) & M] + 0.5 * ring[(n0 + i - dl - 1) & M];   // darker with every pass
+            const y = clamp1(mono[i] + g * lp);
+            ring[(n0 + i) & M] = y;
+            acc[i] = clamp1(acc[i] + y);
+          }
+        }
+      }
+      const k = mix * 0.1 * 0.17 * (1.25 - g);
+      for (let i = 0; i < N; i++) {
+        L[i] = clamp1(L[i] + outs[0][i] * k);
+        R[i] = clamp1(R[i] + outs[1][i] * k);
+      }
+      this.combN += N;
+    }
+
+    /* The next 23 ms of the music: 512 stereo frames (floats, -1..1). Returns [left, right]. */
+    block() {
+      const p = this.p;
+      this.t += MUS_N;
+      if (this.t >= this.nextOn) {
+        if (this.spawn()) this.nextOn = this.t + Math.trunc(this.gap() * MUS_RATE);
+        else this.nextOn = this.t + Math.trunc(0.12 * MUS_RATE);
+      }
+      const L = this.L, R = this.R;
+      this.voicesBlock(L, R);
+      if (p.pha_mix) this.phaser(L, R, p.pha_mix);
+      if (p.fla_mix) this.flanger(L, R, p.fla_mix); else this.pushDry(L, R);
+      this.dryN += MUS_N;
+      if (p.dly_mix) this.echo(L, R, p.dly_mix); else this.pushEchoMono(L, R);
+      this.reverb(L, R, p.rev_mix ? p.rev_mix : 0.0);
+      const vol = Math.pow(p.vol / 10.0, 2) * 3.0;
+      this.fade = Math.min(1.0, this.fade + MUS_N / (2.0 * MUS_RATE));
+      const gain = vol * this.fade;
+      for (let i = 0; i < MUS_N; i++) { L[i] = clamp1(L[i] * gain); R[i] = clamp1(R[i] * gain); }
+      return [L, R];
+    }
+
+    /* Offline: seconds of music as two Float32Arrays (used by tests). */
+    render(seconds) {
+      const blocks = Math.floor(seconds * MUS_RATE / MUS_N);
+      const L = new Float32Array(blocks * MUS_N), R = new Float32Array(blocks * MUS_N);
+      for (let b = 0; b < blocks; b++) {
+        const [l, r] = this.block();
+        L.set(l, b * MUS_N); R.set(r, b * MUS_N);
+      }
+      return [L, R];
+    }
+  }
+
+  return { MUS_RATE, MUS_N, MUS_INSTRUMENTS, MUS_DEFAULTS, MUS_LIMITS, BLACK_PCS, NOTE_NAMES, musicClean,
+           musicPitches, musicNoteName, mulberry32, synthNote, noteKey, AmbientEngine };
+}
+
+/* ---------------------------------------------------------------- Web Worker: builds the notes */
+function musicWorkerMain(C) {
+  let queue = [];
+  let busy = false;
+  async function run() {
+    busy = true;
+    while (queue.length) {
+      const [inst, midi, long] = queue.shift();
+      let data = null;
+      try { data = C.synthNote(inst, midi, long); } catch (e) { data = null; }
+      if (data) postMessage({ inst, midi, long, data }, [data.buffer]);
+      await new Promise(r => setTimeout(r, 0));               // let a new "want" message in
+    }
+    busy = false;
+  }
+  onmessage = (e) => {
+    if (e.data && e.data.cmd === 'want') { queue = e.data.keys.slice(); if (!busy) run(); }
+  };
+}
+
+/* ---------------------------------------------------------------- AudioWorklet: the real-time engine */
+function musicWorkletMain(C) {
+  class MahjongMusic extends AudioWorkletProcessor {
+    constructor(options) {
+      super();
+      const po = (options && options.processorOptions) || {};
+      this.engine = new C.AmbientEngine(po.p);
+      this.running = false;
+      this.CAP = 8192;
+      this.fl = new Float32Array(this.CAP);
+      this.fr = new Float32Array(this.CAP);
+      this.wi = 0;                                   // engine frames produced so far
+      this.rp = 0;                                   // read position (engine frames, fractional)
+      this.step = C.MUS_RATE / sampleRate;           // engine frames per output frame
+      this.port.onmessage = (e) => {
+        const m = e.data;
+        if (m.type === 'note') this.engine.addNote(m.inst, m.midi, m.long, m.data);
+        else if (m.type === 'forget') this.engine.forget(m.inst);
+        else if (m.type === 'params') this.engine.p = m.p;
+        else if (m.type === 'start') { this.engine.reset(); this.wi = 0; this.rp = 0; this.running = true; }
+        else if (m.type === 'stop') { this.running = false; }
+      };
+    }
+    process(inputs, outputs) {
+      const out = outputs[0];
+      const L = out[0];
+      const R = out.length > 1 ? out[1] : out[0];
+      const n = L.length;
+      if (!this.running) { L.fill(0); if (R !== L) R.fill(0); return true; }
+      const CAP = this.CAP;
+      for (let i = 0; i < n; i++) {
+        const i0 = Math.floor(this.rp);
+        while (this.wi < i0 + 2) {
+          const [bl, br] = this.engine.block();
+          for (let j = 0; j < C.MUS_N; j++) {
+            this.fl[(this.wi + j) % CAP] = bl[j];
+            this.fr[(this.wi + j) % CAP] = br[j];
+          }
+          this.wi += C.MUS_N;
+        }
+        const fr = this.rp - i0;
+        const a = i0 % CAP, b = (i0 + 1) % CAP;
+        L[i] = this.fl[a] + (this.fl[b] - this.fl[a]) * fr;
+        R[i] = this.fr[a] + (this.fr[b] - this.fr[a]) * fr;
+        this.rp += this.step;
+      }
+      return true;
+    }
+  }
+  registerProcessor('mahjong-music', MahjongMusic);
+}
+
+/* ---------------------------------------------------------------- MusicPlayer: what the game uses */
+const MUSIC = MusicCommon();
+
+class MusicPlayer {
+  constructor(settings) {
+    this.p = MUSIC.musicClean(settings);
+    this.ctx = null;
+    this.node = null;
+    this.worker = null;
+    this.analyser = null;
+    this.running = false;
+    this.error = '';
+    this.have = new Set();
+    this.haveInst = null;
+    this.sig = null;
+    this.starting = null;
+    this.notesReady = 0;
+  }
+
+  get available() {
+    return typeof window !== 'undefined' && !!(window.AudioContext || window.webkitAudioContext) &&
+           !!window.AudioWorklet && !!window.Worker && !!window.Blob && !!(window.URL && URL.createObjectURL);
+  }
+
+  set(kw) {
+    const q = Object.assign({}, this.p, kw);
+    this.p = MUSIC.musicClean(q);
+    if (this.running && this.node) {
+      this.node.port.postMessage({ type: 'params', p: this.p });
+      this.syncBank();
+    }
+  }
+
+  syncBank() {
+    const p = this.p;
+    const sig = [p.inst, p.oct_lo, p.oct_n, p.long > 0].join('|');
+    if (sig === this.sig) return;
+    this.sig = sig;
+    const order = MUSIC.musicPitches(p);
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const t = order[i]; order[i] = order[j]; order[j] = t;
+    }
+    let keys = order.map(m => [p.inst, m, false]);
+    if (p.long > 0) keys = keys.concat(order.map(m => [p.inst, m, true]));
+    if (this.haveInst !== p.inst) {                              // forget the other instruments
+      this.have.clear();
+      this.haveInst = p.inst;
+      this.node.port.postMessage({ type: 'forget', inst: p.inst });
+    }
+    this.worker.postMessage({ cmd: 'want', keys: keys.filter(k => !this.have.has(MUSIC.noteKey(k[0], k[1], k[2]))) });
+  }
+
+  /* Must be called from a click or key press the first time (browsers only allow sound after one). */
+  start() {
+    if (!this.available) return Promise.resolve(false);
+    if (this.running) return Promise.resolve(true);
+    if (this.starting) return this.starting;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    try {
+      if (!this.ctx) {
+        try { this.ctx = new AC({ sampleRate: MUSIC.MUS_RATE, latencyHint: 'playback' }); }
+        catch (e) { this.ctx = new AC({ latencyHint: 'playback' }); }
+      }
+      const resumed = this.ctx.resume();
+      this.error = '';
+      this.starting = (async () => {
+        try {
+          await resumed;
+          if (!this.node) {
+            const src = MusicCommon.toString() + '\n(' + musicWorkletMain.toString() + ')(MusicCommon());';
+            // A page opened straight from disk (file://) may not load blob: modules, so fall back to a data: URL.
+            const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+            try { await this.ctx.audioWorklet.addModule(url); }
+            catch (e1) { await this.ctx.audioWorklet.addModule('data:text/javascript;charset=utf-8,' + encodeURIComponent(src)); }
+            URL.revokeObjectURL(url);
+            this.node = new AudioWorkletNode(this.ctx, 'mahjong-music',
+              { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2], processorOptions: { p: this.p } });
+            this.analyser = this.ctx.createAnalyser();
+            this.analyser.fftSize = 2048;
+            this.node.connect(this.analyser);
+            this.analyser.connect(this.ctx.destination);
+            const wsrc = MusicCommon.toString() + '\n(' + musicWorkerMain.toString() + ')(MusicCommon());';
+            const wurl = URL.createObjectURL(new Blob([wsrc], { type: 'text/javascript' }));
+            this.worker = new Worker(wurl);
+            URL.revokeObjectURL(wurl);
+            this.worker.onmessage = (e) => {
+              const m = e.data;
+              if (m.inst !== this.p.inst) return;                // a note of an instrument no longer chosen
+              this.have.add(MUSIC.noteKey(m.inst, m.midi, m.long));
+              this.notesReady = this.have.size;
+              this.node.port.postMessage({ type: 'note', inst: m.inst, midi: m.midi, long: m.long, data: m.data }, [m.data.buffer]);
+            };
+          }
+          await this.ctx.resume();
+          this.sig = null;
+          this.node.port.postMessage({ type: 'params', p: this.p });
+          this.node.port.postMessage({ type: 'start' });
+          this.running = true;
+          this.syncBank();
+          return true;
+        } catch (e) {
+          this.error = String((e && e.message) || e);
+          this.running = false;
+          return false;
+        } finally {
+          this.starting = null;
+        }
+      })();
+      return this.starting;
+    } catch (e) {
+      this.error = String((e && e.message) || e);
+      return Promise.resolve(false);
+    }
+  }
+
+  stop() {
+    this.running = false;
+    if (this.node) this.node.port.postMessage({ type: 'stop' });
+    if (this.ctx && this.ctx.state === 'running') this.ctx.suspend();
+  }
+}
+
+if (typeof module !== 'undefined') module.exports = { MusicCommon, musicWorkerMain, musicWorkletMain };
+'use strict';
+/* =====================================================================================================
+   Mahjong Solitaire - screens, drawing and input (canvas). Everything on screen is a copy of the Python
+   version: same positions, colours, buttons and hot keys. Browser differences: files are picked with the
+   browser's file chooser and saved as downloads, settings live in localStorage, and QUIT is FULLSCREEN.
+   ===================================================================================================== */
+
+const FPS_FONT = 'Helvetica, Arial, sans-serif';
+const FONT_K = 0.69;                         // pygame's default font size -> CSS pixels
+const MIN_W = 1280, MIN_H = 720;             // below this the whole picture is scaled down to fit
+const SETTINGS_KEY = 'mahjong_settings';
+const NOTE_MS = 2800;
+
+const MUS_ROWS = [
+  ['Lowest octave', 'oct_lo', (v, p) => `${v}   (lowest note ${MUSIC.musicNoteName(MUSIC.musicPitches(p)[0])})`],
+  ['Number of octaves', 'oct_n', (v, p) => { const a = MUSIC.musicPitches(p); return `${v}   (highest note ${MUSIC.musicNoteName(a[a.length - 1])})`; }],
+  ['Note density', 'density', (v) => `${v} / 15   (aims for ${(1.0 / (9.0 * Math.pow(0.78, v - 1))).toFixed(1)} notes a second)`],
+  ['Chance of long notes', 'long', (v) => `${v * 10} %`],
+  ['Most notes at once', 'voices', (v) => `${v}`],
+  ['Volume', 'vol', (v) => `${v} / 10`],
+  null,
+  ['Reverb amount', 'rev_mix', (v) => `${v} / 10`],
+  ['Reverb length', 'rev_len', (v) => `${v} / 10`],
+  ['Echo amount', 'dly_mix', (v) => `${v} / 10`],
+  ['Echo time', 'dly_time', (v) => `${(0.12 + 0.075 * v).toFixed(2)} s`],
+  ['Phaser amount', 'pha_mix', (v) => `${v} / 10`],
+  ['Phaser speed', 'pha_rate', (v) => `${(0.05 + 0.09 * v).toFixed(2)} Hz`],
+  ['Flanger amount', 'fla_mix', (v) => `${v} / 10`],
+  ['Flanger speed', 'fla_rate', (v) => `${(0.04 + 0.05 * v).toFixed(2)} Hz`],
+];
+
+const rgb = (c) => `rgb(${c[0]},${c[1]},${c[2]})`;
+const inRect = (r, x, y) => x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+const makeCanvas = (w, h) => { const c = document.createElement('canvas'); c.width = Math.max(1, w); c.height = Math.max(1, h); return c; };
+
+function loadSettings() {
+  try { const d = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); return d && typeof d === 'object' ? d : {}; }
+  catch (e) { return {}; }
+}
+function saveSettings(d) { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(d)); } catch (e) { /* private mode */ } }
+
+/* ---------------------------------------------------------------- browser file helpers */
+function pickFiles(accept, multiple) {
+  return new Promise((resolve) => {
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = accept || '';
+    inp.multiple = !!multiple;
+    inp.style.display = 'none';
+    document.body.appendChild(inp);
+    const done = (files) => { inp.remove(); resolve(files); };
+    inp.addEventListener('change', () => done(Array.from(inp.files || [])));
+    inp.addEventListener('cancel', () => done([]));
+    inp.click();
+  });
+}
+function downloadText(name, text) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+const readText = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.onerror = () => rej(r.error); r.readAsText(file); });
+const readDataUrl = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.onerror = () => rej(r.error); r.readAsDataURL(file); });
+const loadImage = (url) => new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('not an image')); i.src = url; });
+
+/* ---------------------------------------------------------------- pictures */
+function imageToCanvas(img) {
+  const c = makeCanvas(img.naturalWidth || img.width, img.naturalHeight || img.height);
+  c.getContext('2d').drawImage(img, 0, 0);
+  return c;
+}
+/* clockwise rotation (0/90/180/270) of a canvas */
+function rotateCanvas(src, deg) {
+  deg = ((deg % 360) + 360) % 360;
+  if (!deg) return src;
+  const sw = src.width, sh = src.height;
+  const c = (deg === 180) ? makeCanvas(sw, sh) : makeCanvas(sh, sw);
+  const g = c.getContext('2d');
+  g.translate(c.width / 2, c.height / 2);
+  g.rotate(deg * Math.PI / 180);
+  g.drawImage(src, -sw / 2, -sh / 2);
+  return c;
+}
+
+/* One picture in the tileset editor's gallery (max 18). */
+class ImageEntry {
+  constructor(name, base, dataUrl) {
+    this.name = name;
+    this.base = base;              // canvas, unrotated
+    this.dataUrl = dataUrl;        // the original file, kept for SAVE
+    this.rotation = 0;             // clockwise degrees
+    this.crop = null;              // [x, y, w, h] in ROTATED-image coordinates
+    this._rot = null;
+    this._thumb = null;
+  }
+  surface() {
+    if (this.rotation === 0) return this.base;
+    if (!this._rot || this._rot[0] !== this.rotation) this._rot = [this.rotation, rotateCanvas(this.base, this.rotation)];
+    return this._rot[1];
+  }
+  thumb(box) {
+    const key = this.rotation + '|' + box;
+    if (!this._thumb || this._thumb[0] !== key) {
+      const s = this.surface();
+      const f = Math.min(box / s.width, box / s.height);
+      const c = makeCanvas(Math.max(1, Math.floor(s.width * f)), Math.max(1, Math.floor(s.height * f)));
+      const g = c.getContext('2d');
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(s, 0, 0, c.width, c.height);
+      this._thumb = [key, c];
+    }
+    return this._thumb[1];
+  }
+  /* rotate by a multiple of 90 (positive = clockwise); the crop box follows the picture */
+  rotate(deltaCw) {
+    const steps = (((deltaCw / 90) % 4) + 4) % 4;
+    for (let i = 0; i < steps; i++) {
+      const h = this.surface().height;
+      if (this.crop) {
+        const [x, y, cw, ch] = this.crop;
+        this.crop = [h - (y + ch), x, ch, cw];
+      }
+      this.rotation = (this.rotation + 90) % 360;
+    }
+  }
+}
+
+/* One custom picture used for every tile of a kind+value. */
+class CustomTile {
+  constructor(kind, value, entry) {
+    this.kind = kind; this.value = value;
+    this.name = entry.name; this.dataUrl = entry.dataUrl;
+    this.base = entry.base;
+    this.crop = entry.crop ? entry.crop.slice() : null;
+    this.rotation = entry.rotation || 0;
+    this.surface = null;
+  }
+  load() {
+    this.surface = null;
+    try {
+      let img = rotateCanvas(this.base, this.rotation);
+      let sx = 0, sy = 0, sw = img.width, sh = img.height;
+      if (this.crop) {
+        let [x, y, w, h] = this.crop.map(Math.trunc);
+        x = Math.max(0, Math.min(x, img.width - 1));
+        y = Math.max(0, Math.min(y, img.height - 1));
+        w = Math.max(1, Math.min(w, img.width - x));
+        h = Math.max(1, Math.min(h, img.height - y));
+        sx = x; sy = y; sw = w; sh = h;
+      }
+      const c = makeCanvas(TILE_W - TILE_INSET, TILE_H - TILE_INSET);
+      const g = c.getContext('2d');
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(img, sx, sy, sw, sh, 0, 0, c.width, c.height);
+      this.surface = c;
+      return true;
+    } catch (e) { return false; }
+  }
+}
+
+class Button {
+  constructor(x, y, w, h, text, cb, size = 28, fill = null) {
+    this.rect = { x, y, w, h };
+    this.text = text; this.cb = cb; this.size = size; this.fill = fill;
+  }
+  draw(g, hov) {
+    const r = this.rect;
+    let col;
+    if (this.fill) col = hov ? rgb(this.fill.map(c => Math.min(255, c + 28))) : rgb(this.fill);
+    else col = hov ? 'rgb(110,110,160)' : 'rgb(80,80,120)';
+    g.fillStyle = col;
+    rrect(g, r.x, r.y, r.w, r.h, 8); g.fill();
+    g.strokeStyle = 'rgb(255,215,60)'; g.lineWidth = 2;
+    rrect(g, r.x + 1, r.y + 1, r.w - 2, r.h - 2, 7); g.stroke();
+    text(g, this.text, r.x + r.w / 2, r.y + r.h / 2, this.size, '#fff', 'center');
+  }
+  click(x, y) { if (inRect(this.rect, x, y)) { if (this.cb) this.cb(); return true; } return false; }
+}
+
+function rrect(g, x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h / 2));
+  g.beginPath();
+  g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+/* text: pygame font size -> CSS font; align left | center | midleft handled by 'align' */
+function text(g, s, x, y, size, color, align, bold) {
+  g.font = `${bold ? 'bold ' : ''}${Math.max(6, Math.round(size * FONT_K))}px ${FPS_FONT}`;
+  g.fillStyle = color;
+  g.textAlign = align === 'center' ? 'center' : 'left';
+  g.textBaseline = 'middle';
+  g.fillText(s, x, y);
+}
+function strokeInside(g, r, w, color, radius) {          // pygame draws a border inside the rectangle
+  g.strokeStyle = color; g.lineWidth = w;
+  rrect(g, r.x + w / 2, r.y + w / 2, r.w - w, r.h - w, Math.max(0, radius - w / 2)); g.stroke();
+}
+
+/* ================================================================================================= game */
+class Game extends GameCore {
+  constructor(canvas) {
+    super({ now: () => performance.now(), width: MIN_W, height: MIN_H });
+    this.canvas = canvas;
+    this.g = canvas.getContext('2d');
+    this.uiScale = 1;
+    this.mx = -1; this.my = -1;
+    this.mode = 'menu';
+    this.buttons = [];
+    this.faces = new Map();
+    this.fullscreenOk = !!(document.documentElement.requestFullscreen);
+
+    // layout editor
+    this.editorLayer = 0;
+    // tileset editor
+    this.images = [];
+    this.imageIndex = 0;
+    this.dragStart = null; this.dragNow = null;
+    this.assignBtn = null;
+    this.selKind = 'letter'; this.selValue = 'A';
+
+    // music
+    this.settings = loadSettings();
+    this.music = new MusicPlayer(this.settings.music);
+    this.musicToggleBtn = null;
+    this.musicInstBtns = [];
+    this.musicButtons = [];
+    this.audioWanted = this.music.p.on;           // the browser only lets sound start after a click / key
+    this.errSeen = '';
+
+    this.resize();
+    this.showMenu();
+  }
+
+  canPlay() { return this.mode === 'game'; }
+
+  /* ---------------------------------------------------------- size */
+  resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const cw = window.innerWidth, ch = window.innerHeight;
+    this.uiScale = Math.min(1, cw / MIN_W, ch / MIN_H);
+    this.WIDTH = Math.floor(cw / this.uiScale);
+    this.HEIGHT = Math.floor(ch / this.uiScale);
+    this.canvas.width = Math.floor(cw * dpr);
+    this.canvas.height = Math.floor(ch * dpr);
+    this.canvas.style.width = cw + 'px';
+    this.canvas.style.height = ch + 'px';
+    this.pxScale = dpr * this.uiScale;
+    this.rebuildUI();
+  }
+  rebuildUI() {
+    switch (this.mode) {
+      case 'menu': this.buildMenu(); break;
+      case 'game': this.recalculateView(); this.buildGameUI(); break;
+      case 'editor': this.buildEditorUI(); break;
+      case 'tileset': this.buildTilesetUI(); break;
+      case 'music': this.buildMusicUI(); break;
+    }
+  }
+
+  /* ---------------------------------------------------------- tile faces */
+  face(kind, value, color) {
+    const key = kind + value + color;
+    let c = this.faces.get(key);
+    if (c) return c;
+    const w = TILE_W - TILE_INSET, h = TILE_H - TILE_INSET;
+    c = makeCanvas(w, h);
+    const g = c.getContext('2d');
+    g.font = `${Math.round(66 * 0.72)}px ${FPS_FONT}`;
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    const cx = w / 2, cy = h / 2 + 2;
+    g.fillStyle = '#fff';
+    for (const [dx, dy] of [[-3, 0], [3, 0], [0, -3], [0, 3], [-2, -2], [2, 2], [-2, 2], [2, -2]]) g.fillText(value, cx + dx, cy + dy);
+    g.fillStyle = rgb(COLORS[color]);
+    g.fillText(value, cx, cy);
+    this.faces.set(key, c);
+    return c;
+  }
+
+  /* ---------------------------------------------------------- screens */
+  showMenu() {
+    this.mode = 'menu';
+    this.pending = []; this.locked = false;
+    this.dragStart = this.dragNow = null;
+    this.buildMenu();
+  }
+  buildMenu() {
+    const cx = Math.floor(this.WIDTH / 2);
+    this.menuTitleY = Math.max(70, Math.floor(this.HEIGHT * 0.20));
+    const top = this.menuTitleY + 52 + 70, step = 70;
+    this.musicButtons = [];
+    this.buttons = [
+      new Button(cx - 150, top, 300, 55, 'PLAY', () => this.startGame()),
+      new Button(cx - 150, top + step, 300, 55, 'LAYOUT EDITOR', () => this.startLayoutEditor()),
+      new Button(cx - 150, top + step * 2, 300, 55, 'TILESET EDITOR', () => this.startTilesetEditor()),
+      new Button(cx - 150, top + step * 3, 300, 55, 'MUSIC', () => this.showMusicUI()),
+      new Button(cx - 150, top + step * 4, 300, 55, 'FULLSCREEN', () => this.toggleFullscreen()),
+    ];
+  }
+  toggleFullscreen() {
+    try {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else if (this.fullscreenOk) document.documentElement.requestFullscreen();
+      else this.notify('Fullscreen is not available in this browser');
+    } catch (e) { this.notify('Fullscreen is not available'); }
+  }
+
+  startGame() { this.mode = 'game'; this.buildGameUI(); this.newDeal(); }
+  buildGameUI() {
+    this.musicButtons = [];
+    const bw = 120, bh = 50, gap = 10, y = this.HEIGHT - 75, x = 30;
+    const mb = new Button(x + (bw + gap) * 4, y, 170, bh, '', () => this.toggleMusic());
+    this.musicButtons.push(mb);
+    this.buttons = [
+      new Button(30, 30, 130, 42, 'MENU', () => this.showMenu()),
+      new Button(x, y, bw, bh, 'FIND', () => this.findMove()),
+      new Button(x + bw + gap, y, bw, bh, 'UNDO', () => this.undoMove()),
+      new Button(x + (bw + gap) * 2, y, bw, bh, 'SHUFFLE', () => this.reshuffle()),
+      new Button(x + (bw + gap) * 3, y, bw, bh, 'NEW', () => this.newDeal()),
+      mb,
+    ];
+    this.refreshMusicLabels();
+  }
+  startLayoutEditor() {
+    this.mode = 'editor';
+    if (!this.layoutData) this.layoutData = LAYOUTS[this.layoutName]().map(c => c.slice());
+    this.editorLayer = 0;
+    this.buildEditorUI();
+  }
+  buildEditorUI() {
+    this.setView(EDITOR_COLS[0], EDITOR_COLS[1], EDITOR_ROWS[0], EDITOR_ROWS[1], EDITOR_MAX_LAYER);
+    const W = this.WIDTH;
+    this.buttons = [
+      new Button(30, 30, 110, 42, 'MENU', () => this.showMenu()),
+      new Button(W - 355, 30, 105, 42, 'RESET', () => this.resetLayout()),
+      new Button(W - 240, 30, 105, 42, 'SAVE', () => this.saveLayout()),
+      new Button(W - 125, 30, 105, 42, 'LOAD', () => this.loadLayout()),
+    ];
+  }
+  startTilesetEditor() { this.mode = 'tileset'; this.dragStart = this.dragNow = null; this.buildTilesetUI(); }
+  buildTilesetUI() {
+    const W = this.WIDTH;
+    this.assignBtn = new Button(890, 88, 190, 42, 'ASSIGN', () => this.assignCrop());
+    this.buttons = [
+      new Button(30, 30, 110, 42, 'MENU', () => this.showMenu()),
+      new Button(W - 570, 30, 170, 42, 'ADD IMAGES', () => this.addImages()),
+      new Button(W - 390, 30, 170, 42, 'REMOVE IMAGE', () => this.removeImage()),
+      new Button(W - 210, 30, 90, 42, 'SAVE', () => this.saveTs()),
+      new Button(W - 110, 30, 90, 42, 'OPEN', () => this.loadTs()),
+      new Button(420, 88, 50, 42, '<', () => this.prevImage()),
+      new Button(476, 88, 50, 42, '>', () => this.nextImage()),
+      new Button(540, 88, 160, 42, 'ROTATE LEFT', () => this.rotateLeft()),
+      new Button(710, 88, 170, 42, 'ROTATE RIGHT', () => this.rotateRight()),
+      this.assignBtn,
+      new Button(1090, 88, 160, 42, 'CLEAR VALUE', () => this.clearValue()),
+    ];
+  }
+
+  /* ---------------------------------------------------------- music */
+  refreshMusicLabels() {
+    const t = this.music.p.on ? 'MUSIC: ON' : 'MUSIC: OFF';
+    for (const b of this.musicButtons) b.text = t;
+  }
+  musicProblem() {
+    const mu = this.music;
+    if (!mu.available) return "This browser can't play the music (it needs AudioWorklet).";
+    if (mu.error) return 'Sound problem: ' + mu.error;
+    return '';
+  }
+  saveMusicSettings() { this.settings.music = Object.assign({}, this.music.p); saveSettings(this.settings); }
+  toggleMusic() {
+    const mu = this.music;
+    const on = !mu.p.on;
+    mu.set({ on });
+    this.audioWanted = false;
+    if (on) {
+      this.notify('Music on');
+      mu.start().then(() => { const p = this.musicProblem(); if (p) this.notify(p); });
+    } else {
+      mu.stop();
+      this.notify('Music off');
+    }
+    this.refreshMusicLabels();
+    this.saveMusicSettings();
+  }
+  /* The first click or key press of the visit: browsers only allow sound after one. */
+  unlockAudio() {
+    if (!this.audioWanted) return;
+    this.audioWanted = false;
+    if (this.music.p.on) this.music.start();
+  }
+
+  musicGeometry() {
+    const cx = Math.floor(this.WIDTH / 2);
+    const oy = Math.max(0, Math.floor((this.HEIGHT - 780) / 2));
+    const step = this.HEIGHT >= 720 ? 29 : Math.max(20, Math.floor((this.HEIGHT - 330) / 14));
+    const toggleY = 96 + oy, instY = toggleY + 40;
+    let y = instY + 42;
+    const rows = [];
+    for (const row of MUS_ROWS) { rows.push([row, y]); y += row === null ? 22 : step; }
+    return { cx, oy, x0: cx - 330, toggleY, instY, rows, endY: y + 8, pmH: Math.min(24, step - 2) };
+  }
+  showMusicUI() { this.mode = 'music'; this.buildMusicUI(); }
+  buildMusicUI() {
+    this.musicButtons = [];
+    const g = this.musicGeometry(), x0 = g.x0, grey = [42, 48, 66];
+    this.musicToggleBtn = new Button(x0, g.toggleY, 140, 30, '', () => this.toggleMusic(), 24, grey);
+    const btns = [this.musicToggleBtn];
+    this.musicInstBtns = [];
+    MUSIC.MUS_INSTRUMENTS.forEach((nm, q) => {
+      const b = new Button(x0 + 190 + q * 112, g.instY, 106, 30, nm, () => this.setInstrument(nm), 22, grey);
+      btns.push(b); this.musicInstBtns.push([b, nm]);
+    });
+    for (const [row, y] of g.rows) {
+      if (row === null) continue;
+      const key = row[1];
+      btns.push(new Button(x0 + 190, y, 28, g.pmH, '-', () => this.adjustMusic(key, -1), 26, grey));
+      btns.push(new Button(x0 + 434, y, 28, g.pmH, '+', () => this.adjustMusic(key, 1), 26, grey));
+    }
+    btns.push(new Button(x0, g.endY, 200, 32, 'Reset to defaults', () => this.resetMusic(), 24, grey));
+    btns.push(new Button(x0 + 460, g.endY, 200, 32, 'Back  [Esc]', () => this.showMenu(), 24, [45, 106, 58]));
+    this.buttons = btns;
+  }
+  setInstrument(n) { this.music.set({ inst: n }); this.saveMusicSettings(); }
+  adjustMusic(key, d) { this.music.set({ [key]: this.music.p[key] + d }); this.saveMusicSettings(); }
+  resetMusic() { this.music.set(Object.assign({}, MUSIC.MUS_DEFAULTS, { on: this.music.p.on })); this.saveMusicSettings(); }
+  musicScreenNotes() {
+    const mu = this.music;
+    if (!mu.available) return ["This browser can't play the music (it needs AudioWorklet support)."];
+    if (mu.error) return ['Sound problem: ' + mu.error];
+    return [];
+  }
+
+  /* ---------------------------------------------------------- layout editor */
+  editorClick(x, y, remove, half) {
+    if (!this.layoutData) return;
+    if (remove) {
+      const cells = this.layoutData.slice().sort((a, b) => (b[2] - a[2]) || (b[1] - a[1]) || (b[0] - a[0]));
+      for (const c of cells) {
+        if (inRect(this.cellRect(c[0], c[1], c[2]), x, y)) {
+          this.layoutData.splice(this.layoutData.indexOf(c), 1);
+          this.layoutEdited = true;
+          return;
+        }
+      }
+      return;
+    }
+    const z = this.editorLayer, s = this.scale;
+    const fx = (x - this.offsetX - z * LAYER_DX * s) / (TILE_W * s) + this.originGx;
+    const fy = (y - this.offsetY + z * LAYER_DY * s) / (TILE_H * s) + this.originGy;
+    const step = half ? 0.5 : 1.0;
+    const pyRound = (v) => { const f = Math.floor(v), d = v - f; return d > 0.5 ? f + 1 : (d < 0.5 ? f : (f % 2 === 0 ? f : f + 1)); };
+    let gx = pyRound((fx - 0.47) / step) * step;
+    let gy = pyRound((fy - 0.47) / step) * step;
+    gx = Math.max(EDITOR_COLS[0], Math.min(EDITOR_COLS[1], gx));
+    gy = Math.max(EDITOR_ROWS[0], Math.min(EDITOR_ROWS[1], gy));
+    if (!this.layoutData.some(c => c[0] === gx && c[1] === gy && c[2] === z)) {
+      this.layoutData.push([gx, gy, z]);
+      this.layoutEdited = true;
+    }
+  }
+  resetLayout() {
+    this.layoutData = LAYOUTS[this.layoutName]().map(c => c.slice());
+    this.layoutEdited = false;
+    this.notify('Layout reset to Exact Turtle');
+  }
+  saveLayout() { downloadText('layout.json', JSON.stringify(this.layoutData)); this.notify('Layout saved (downloaded layout.json)'); }
+  async loadLayout() {
+    const [f] = await pickFiles('.json,application/json', false);
+    if (!f) return;
+    try {
+      const data = JSON.parse(await readText(f));
+      const cells = data.map(c => [Number(c[0]), Number(c[1]), Math.trunc(Number(c[2]))]);
+      if (!cells.length) throw new Error('file contains no tiles');
+      if (cells.some(c => c.some(v => !isFinite(v)))) throw new Error('bad numbers in file');
+      this.layoutData = cells;
+      this.layoutEdited = true;
+      this.notify('Layout loaded.');
+    } catch (e) { this.notify('Could not load layout: ' + e.message); }
+  }
+
+  /* ---------------------------------------------------------- tileset editor */
+  cur() {
+    if (!this.images.length) return null;
+    this.imageIndex = Math.max(0, Math.min(this.imageIndex, this.images.length - 1));
+    return this.images[this.imageIndex];
+  }
+  nextImage() { if (this.images.length) { this.imageIndex = (this.imageIndex + 1) % this.images.length; this.dragStart = this.dragNow = null; } }
+  prevImage() { if (this.images.length) { this.imageIndex = (this.imageIndex - 1 + this.images.length) % this.images.length; this.dragStart = this.dragNow = null; } }
+  rotateLeft() {
+    const e = this.cur();
+    if (!e) { this.notify('Add an image first'); return; }
+    e.rotate(-90); this.dragStart = this.dragNow = null; this.notify(`Rotated left - now ${e.rotation} deg`);
+  }
+  rotateRight() {
+    const e = this.cur();
+    if (!e) { this.notify('Add an image first'); return; }
+    e.rotate(90); this.dragStart = this.dragNow = null; this.notify(`Rotated right - now ${e.rotation} deg`);
+  }
+  paletteBoxes() {
+    const boxes = [];
+    const x0 = 30, y0 = 150, bw = 52, bh = 38, gap = 4, cols = 6;
+    TILE_TYPES.letter.forEach((v, i) => {
+      const r = Math.floor(i / cols), c = i % cols;
+      boxes.push([{ x: x0 + c * (bw + gap), y: y0 + r * (bh + gap), w: bw, h: bh }, 'letter', v]);
+    });
+    const rowsL = Math.ceil(TILE_TYPES.letter.length / cols);
+    const y1 = y0 + rowsL * (bh + gap) + 40;
+    TILE_TYPES.digit.forEach((v, i) => {
+      const r = Math.floor(i / cols), c = i % cols;
+      boxes.push([{ x: x0 + c * (bw + gap), y: y1 + r * (bh + gap), w: bw, h: bh }, 'digit', v]);
+    });
+    const rowsD = Math.ceil(TILE_TYPES.digit.length / cols);
+    return { boxes, labL: y0 - 24, labD: y1 - 24, prevY: y1 + rowsD * (bh + gap) + 40 };
+  }
+  thumbRects() {
+    const n = this.images.length;
+    if (!n) return [];
+    const avail = this.WIDTH - 420 - 30;
+    const box = Math.max(24, Math.min(56, Math.floor(avail / MAX_IMAGES) - 4));
+    return this.images.map((_, i) => [{ x: 420 + i * (box + 4), y: 162, w: box, h: box }, i]);
+  }
+  tilesetView() {
+    const e = this.cur();
+    if (!e) return null;
+    const s = e.surface(), iw = s.width, ih = s.height;
+    const dx = 420, dy = 228;
+    const aw = Math.max(50, this.WIDTH - dx - 30), ah = Math.max(50, this.HEIGHT - dy - 80);
+    const f = Math.min(aw / iw, ah / ih, 3.0);
+    return { dx, dy, f, dw: Math.max(1, Math.floor(iw * f)), dh: Math.max(1, Math.floor(ih * f)) };
+  }
+  tilesetPress(x, y) {
+    for (const [r, kind, val] of this.paletteBoxes().boxes) if (inRect(r, x, y)) { this.selKind = kind; this.selValue = val; return; }
+    for (const [r, idx] of this.thumbRects()) if (inRect(r, x, y)) { this.imageIndex = idx; this.dragStart = this.dragNow = null; return; }
+    const v = this.tilesetView();
+    if (v && inRect({ x: v.dx, y: v.dy, w: v.dw, h: v.dh }, x, y)) { this.dragStart = [x, y]; this.dragNow = [x, y]; }
+  }
+  tilesetMotion(x, y) { if (this.dragStart) this.dragNow = [x, y]; }
+  tilesetRelease(x, y) {
+    if (!this.dragStart) return;
+    const [x0, y0] = this.dragStart;
+    this.dragStart = this.dragNow = null;
+    const v = this.tilesetView(), e = this.cur();
+    if (!v || !e) return;
+    const s = e.surface(), iw = s.width, ih = s.height;
+    const cl = (val, hi) => Math.max(0, Math.min(hi, val));
+    const ix0 = cl((Math.min(x0, x) - v.dx) / v.f, iw), iy0 = cl((Math.min(y0, y) - v.dy) / v.f, ih);
+    const ix1 = cl((Math.max(x0, x) - v.dx) / v.f, iw), iy1 = cl((Math.max(y0, y) - v.dy) / v.f, ih);
+    const w = ix1 - ix0, h = iy1 - iy0;
+    if (w >= 4 && h >= 4) {
+      e.crop = [Math.trunc(ix0), Math.trunc(iy0), Math.trunc(w), Math.trunc(h)];
+      this.notify('Crop set - pick a letter/digit, then ASSIGN');
+    }
+  }
+  assignCrop() {
+    const e = this.cur();
+    if (!e) { this.notify('Add an image first (ADD IMAGES)'); return; }
+    const t = new CustomTile(this.selKind, this.selValue, e);
+    if (t.load()) {
+      this.customTs[this.selKind][this.selValue] = t;
+      this.notify(`Assigned ${e.crop ? 'crop' : 'whole image'} to ${this.selKind} ${this.selValue}`);
+    } else this.notify('Could not load that image region');
+  }
+  clearValue() {
+    if (this.customTs[this.selKind][this.selValue]) {
+      delete this.customTs[this.selKind][this.selValue];
+      this.notify(`Cleared ${this.selKind} ${this.selValue}`);
+    } else this.notify('Nothing assigned to that value');
+  }
+  async addImages() {
+    const room = MAX_IMAGES - this.images.length;
+    if (room <= 0) { this.notify(`${MAX_IMAGES} image limit reached - REMOVE IMAGE first`); return; }
+    let files = await pickFiles('image/*,.png,.jpg,.jpeg,.bmp,.gif,.webp', true);
+    if (!files.length) return;
+    const skipped = Math.max(0, files.length - room);
+    files = files.slice(0, room);
+    const first = this.images.length;
+    let failed = 0;
+    for (const f of files) {
+      try {
+        const url = await readDataUrl(f);
+        const img = await loadImage(url);
+        this.images.push(new ImageEntry(f.name, imageToCanvas(img), url));
+      } catch (e) { failed++; }
+    }
+    const added = this.images.length - first;
+    if (added) { this.imageIndex = first; this.dragStart = this.dragNow = null; }
+    let msg = `Added ${added} image${added !== 1 ? 's' : ''}`;
+    if (skipped) msg += ` (${skipped} skipped - limit ${MAX_IMAGES})`;
+    if (failed) msg += ` (${failed} could not be read)`;
+    this.notify(msg);
+  }
+  removeImage() {
+    const e = this.cur();
+    if (!e) { this.notify('No image to remove'); return; }
+    this.images.splice(this.imageIndex, 1);
+    this.imageIndex = Math.max(0, Math.min(this.imageIndex, this.images.length - 1));
+    this.dragStart = this.dragNow = null;
+    this.notify('Removed ' + e.name);
+  }
+  /* The tileset file carries its pictures inside (a browser cannot read files by path). */
+  saveTs() {
+    const data = { images: {}, letter: {}, digit: {} };
+    const keyOf = new Map();
+    for (const kind of KINDS) {
+      for (const [v, t] of Object.entries(this.customTs[kind])) {
+        if (!keyOf.has(t.dataUrl)) { const k = 'img' + keyOf.size; keyOf.set(t.dataUrl, k); data.images[k] = t.dataUrl; }
+        data[kind][v] = { path: t.name, image: keyOf.get(t.dataUrl), crop: t.crop, rotation: t.rotation };
+      }
+    }
+    downloadText('tileset.json', JSON.stringify(data));
+    this.notify('Tileset saved (downloaded tileset.json)');
+  }
+  async loadTs() {
+    const [f] = await pickFiles('.json,application/json', false);
+    if (!f) return;
+    try {
+      const data = JSON.parse(await readText(f));
+      const ts = { letter: {}, digit: {} };
+      const cache = {};
+      let missing = 0;
+      for (const kind of KINDS) {
+        for (const [v, info] of Object.entries(data[kind] || {})) {
+          if (!info || typeof info !== 'object') continue;
+          const url = (data.images || {})[info.image];
+          if (!url) { missing++; continue; }
+          if (!cache[info.image]) cache[info.image] = imageToCanvas(await loadImage(url));
+          const entry = { name: info.path || 'image', dataUrl: url, base: cache[info.image], crop: info.crop, rotation: info.rotation || 0 };
+          const t = new CustomTile(kind, v, entry);
+          t.load();
+          ts[kind][v] = t;
+        }
+      }
+      this.customTs = ts;
+      this.notify(missing ? `Tileset loaded (${missing} entries had no picture inside the file)` : 'Tileset loaded.');
+    } catch (e) { this.notify('Could not load tileset: ' + e.message); }
+  }
+
+  /* ---------------------------------------------------------- input */
+  toLocal(e) {
+    const r = this.canvas.getBoundingClientRect();
+    return [(e.clientX - r.left) / this.uiScale, (e.clientY - r.top) / this.uiScale];
+  }
+  onPointerDown(e) {
+    this.unlockAudio();
+    const [x, y] = this.toLocal(e);
+    this.mx = x; this.my = y;
+    if (e.button === 0) {
+      if (this.buttons.slice().some(b => b.click(x, y))) return;
+      if (this.mode === 'game') { const t = this.tileAt(x, y); if (t) this.clickTile(t); }
+      else if (this.mode === 'editor') this.editorClick(x, y, false, e.shiftKey);
+      else if (this.mode === 'tileset') this.tilesetPress(x, y);
+    } else if (e.button === 2 && this.mode === 'editor') this.editorClick(x, y, true, false);
+  }
+  onPointerMove(e) {
+    const [x, y] = this.toLocal(e);
+    this.mx = x; this.my = y;
+    if (this.mode === 'tileset') this.tilesetMotion(x, y);
+  }
+  onPointerUp(e) {
+    const [x, y] = this.toLocal(e);
+    if (e.button === 0 && this.mode === 'tileset') this.tilesetRelease(x, y);
+  }
+  onWheel(e) {
+    if (this.mode !== 'editor') return;
+    this.editorLayer = e.deltaY < 0 ? Math.min(EDITOR_MAX_LAYER, this.editorLayer + 1) : Math.max(0, this.editorLayer - 1);
+  }
+  onKey(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return false;
+    this.unlockAudio();
+    const k = e.key;
+    if (k === 'Escape') { if (this.mode !== 'menu') this.showMenu(); else return false; }
+    else if (k === 'm' || k === 'M') this.toggleMusic();
+    else if (this.mode === 'game') {
+      if (k === 'f' || k === 'F') this.findMove();
+      else if (k === 'u' || k === 'U') this.undoMove();
+      else if (k === 's' || k === 'S') this.reshuffle();
+      else if (k === 'n' || k === 'N') this.newDeal();
+      else return false;
+    } else if (this.mode === 'editor') {
+      if (k === 'ArrowUp') this.editorLayer = Math.min(EDITOR_MAX_LAYER, this.editorLayer + 1);
+      else if (k === 'ArrowDown') this.editorLayer = Math.max(0, this.editorLayer - 1);
+      else return false;
+    } else if (this.mode === 'tileset') {
+      if (k === 'ArrowLeft') this.prevImage();
+      else if (k === 'ArrowRight') this.nextImage();
+      else if (k === '[') this.rotateLeft();
+      else if (k === ']') this.rotateRight();
+      else return false;
+    } else return false;
+    return true;
+  }
+
+  /* ---------------------------------------------------------- drawing */
+  frame() {
+    this.processPending();
+    this.draw();
+  }
+  draw() {
+    const g = this.g;
+    g.setTransform(this.pxScale, 0, 0, this.pxScale, 0, 0);
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = 'medium';
+    g.fillStyle = 'rgb(30,45,50)';
+    g.fillRect(0, 0, this.WIDTH, this.HEIGHT);
+    if (this.mode === 'menu') this.drawMenu();
+    else if (this.mode === 'game') { this.drawBoard(); this.drawHud(); }
+    else if (this.mode === 'editor') this.drawEditor();
+    else if (this.mode === 'tileset') this.drawTilesetEditor();
+    else if (this.mode === 'music') this.drawMusic();
+
+    const err = this.music.error;
+    if (err && err !== this.errSeen) { this.errSeen = err; this.notify('Sound problem: ' + err); }
+
+    for (const b of this.buttons) b.draw(g, inRect(b.rect, this.mx, this.my));
+    if (this.notification && this.now() - this.notificationTime < NOTE_MS) this.drawNotification();
+  }
+  drawMenu() {
+    const g = this.g, ty = this.menuTitleY, cx = this.WIDTH / 2;
+    text(g, 'MAHJONG SOLITAIRE', cx, ty, 76, 'rgb(255,215,60)', 'center');
+    text(g, 'Exact Turtle layout - A-Z, 0-9 alphanumeric tiles', cx, ty + 52, 30, 'rgb(170,182,174)', 'center');
+    if (this.audioWanted && this.music.available) {
+      const last = this.buttons[this.buttons.length - 1].rect;
+      text(g, 'Click anywhere or press a key to start the music', cx, last.y + last.h + 34, 24, 'rgb(170,182,174)', 'center');
+    }
+  }
+  drawHud() {
+    const g = this.g;
+    const name = this.layoutEdited ? 'Custom' : this.layoutName;
+    const lines = [
+      `Layout: ${name}`,
+      `Tiles left: ${this.tiles.filter(t => t.visible).length}`,
+      `Matches available: ${this.countMoves()}`,
+      `Quadruples: ${this.quadValues.size}`,
+      'F find   U undo   S shuffle   N new',
+      'M music on/off   Esc menu',
+    ];
+    lines.forEach((l, i) => text(g, l, 30, 145 + i * 27 + 9, 26, 'rgb(205,212,208)', 'left'));
+  }
+  drawBoard() {
+    const g = this.g;
+    const ordered = this.tiles.slice().sort((a, b) => (a.z - b.z) || (a.gy - b.gy) || (a.gx - b.gx));
+    const depth = Math.max(2, Math.trunc(4 * this.scale));
+    for (const t of ordered) {
+      if (!t.visible) continue;
+      const r = this.tileRect(t);
+      g.fillStyle = 'rgb(58,48,38)'; rrect(g, r.x + depth, r.y + depth, r.w, r.h, 5); g.fill();
+      g.fillStyle = 'rgb(118,107,85)'; rrect(g, r.x + Math.floor(depth / 2), r.y + Math.floor(depth / 2), r.w, r.h, 5); g.fill();
+      this.drawTile(t);
+    }
+    if (this.won) {
+      g.fillStyle = 'rgba(0,0,0,0.686)'; g.fillRect(0, 0, this.WIDTH, this.HEIGHT);
+      text(g, 'CLEARED!', this.WIDTH / 2, this.HEIGHT / 2 - 20, 84, 'rgb(255,215,60)', 'center');
+      text(g, 'Press NEW for another round', this.WIDTH / 2, this.HEIGHT / 2 + 46, 32, 'rgb(220,226,222)', 'center');
+    }
+  }
+  drawTile(t) {
+    const g = this.g, r = this.tileRect(t);
+    g.fillStyle = t.bg; rrect(g, r.x, r.y, r.w, r.h, 5); g.fill();
+    let art = t.customSurface;
+    if (!art) art = this.face(t.kind, t.value, t.color);
+    const pad = Math.max(1, Math.trunc(2 * this.scale));
+    const iw = r.w - 2 * pad, ih = r.h - 2 * pad;
+    if (iw > 2 && ih > 2) g.drawImage(art, r.x + pad, r.y + pad, iw, ih);
+    const bw = this.scale < 1 ? Math.max(2, Math.trunc(t.borderWidth * this.scale)) : t.borderWidth;
+    strokeInside(g, r, bw, t.border, 5);
+  }
+  drawEditor() {
+    const g = this.g;
+    const cells = (this.layoutData || []).slice().sort((a, b) => (a[2] - b[2]) || (a[1] - b[1]) || (a[0] - b[0]));
+    for (const c of cells) {
+      const r = this.cellRect(c[0], c[1], c[2]);
+      g.fillStyle = c[2] === this.editorLayer ? 'rgb(152,156,158)' : 'rgb(74,80,84)';
+      rrect(g, r.x, r.y, r.w, r.h, 3); g.fill();
+      strokeInside(g, r, 2, 'rgb(118,126,130)', 3);
+      text(g, String(c[2]), r.x + 4, r.y + 3 + 7, 20, 'rgb(235,239,241)', 'left');
+    }
+    text(g, `Editing layer ${this.editorLayer}   (wheel/UP/DOWN = layer, left-click = add, SHIFT = half-step, right-click = remove)`,
+      160, 36 + 10, 28, 'rgb(255,215,60)', 'left');
+    const count = (this.layoutData || []).length;
+    text(g, `${count} tiles placed${count % 2 ? '   (odd - one tile will be dropped)' : ''}`, 30, 82 + 10, 28, 'rgb(200,206,204)', 'left');
+  }
+  drawTilesetEditor() {
+    const g = this.g;
+    if (this.assignBtn) this.assignBtn.text = `ASSIGN TO ${this.selValue}`;
+    const pal = this.paletteBoxes();
+    text(g, 'LETTERS', 30, pal.labL + 8, 24, 'rgb(200,207,203)', 'left');
+    text(g, 'DIGITS', 30, pal.labD + 8, 24, 'rgb(200,207,203)', 'left');
+    for (const [r, kind, val] of pal.boxes) {
+      const selected = this.selKind === kind && val === this.selValue;
+      const assigned = !!this.customTs[kind][val];
+      g.fillStyle = selected ? 'rgb(255,209,51)' : (assigned ? 'rgb(46,140,71)' : 'rgb(72,78,82)');
+      rrect(g, r.x, r.y, r.w, r.h, 4); g.fill();
+      strokeInside(g, r, 1, 'rgb(130,138,141)', 4);
+      text(g, val, r.x + r.w / 2, r.y + r.h / 2, 24, selected ? 'rgb(30,33,34)' : 'rgb(232,237,234)', 'center');
+    }
+    text(g, `Selected: ${this.selKind} ${this.selValue}`, 30, pal.prevY - 24 + 8, 24, 'rgb(255,215,60)', 'left');
+    const custom = this.customTs[this.selKind][this.selValue];
+    if (custom && custom.surface) g.drawImage(custom.surface, 30, pal.prevY);
+
+    const e = this.cur();
+    let status;
+    if (e) status = `Image ${this.imageIndex + 1} of ${this.images.length}: ${e.name}   rotation ${e.rotation} deg   (${e.crop ? 'crop set' : 'no crop - whole image'})`;
+    else status = `No images loaded - click ADD IMAGES (up to ${MAX_IMAGES} at once)`;
+    text(g, status, 420, 138 + 8, 24, 'rgb(220,226,222)', 'left');
+
+    for (const [r, idx] of this.thumbRects()) {
+      g.fillStyle = 'rgb(50,58,62)'; rrect(g, r.x, r.y, r.w, r.h, 3); g.fill();
+      const th = this.images[idx].thumb(r.w - 4);
+      g.drawImage(th, r.x + (r.w - th.width) / 2, r.y + (r.h - th.height) / 2);
+      if (idx === this.imageIndex) strokeInside(g, r, 3, 'rgb(255,215,60)', 3);
+      else strokeInside(g, r, 1, 'rgb(120,128,131)', 3);
+    }
+
+    const v = this.tilesetView();
+    if (v) {
+      g.drawImage(e.surface(), v.dx, v.dy, v.dw, v.dh);
+      g.strokeStyle = 'rgb(255,215,60)'; g.lineWidth = 3;
+      if (this.dragStart && this.dragNow) {
+        const [x0, y0] = this.dragStart, [x1, y1] = this.dragNow;
+        g.strokeRect(Math.min(x0, x1) + 1.5, Math.min(y0, y1) + 1.5, Math.max(0, Math.abs(x1 - x0) - 3), Math.max(0, Math.abs(y1 - y0) - 3));
+      } else if (e.crop) {
+        const [cx, cy, cw, ch] = e.crop;
+        g.strokeRect(Math.trunc(v.dx + cx * v.f) + 1.5, Math.trunc(v.dy + cy * v.f) + 1.5,
+          Math.max(0, Math.trunc(cw * v.f) - 3), Math.max(0, Math.trunc(ch * v.f) - 3));
+      }
+    } else {
+      text(g, 'Click ADD IMAGES, then use < > to browse and drag a crop box.', 420, 240 + 10, 30, 'rgb(190,198,195)', 'left');
+    }
+    text(g, '1) ADD IMAGES   2) < > to browse   3) [ ] or ROTATE   4) drag a box to crop (optional)   5) click a letter/digit   6) ASSIGN   7) SAVE',
+      30, this.HEIGHT - 70 + 8, 24, 'rgb(170,182,174)', 'left');
+  }
+  drawMusic() {
+    const g = this.g, p = this.music.p, geo = this.musicGeometry();
+    const { cx, x0, oy } = geo;
+    const white = 'rgb(207,212,222)', soft = 'rgb(170,176,192)', dim = 'rgb(138,144,164)';
+    text(g, 'MUSIC', cx, 36 + oy, 56, '#fff', 'center', true);
+    text(g, 'Ambient and zen: random notes on the black keys only. It changes as you adjust it.', cx, 66 + oy + 8, 22, dim, 'center');
+
+    if (this.musicToggleBtn) {
+      this.musicToggleBtn.text = 'Music: ' + (p.on ? 'ON' : 'OFF');
+      this.musicToggleBtn.fill = p.on ? [45, 106, 58] : [42, 48, 66];
+    }
+    text(g, '(M turns it on or off at any time)', x0 + 156, geo.toggleY + 15, 22, soft, 'left');
+    text(g, 'Instrument', x0, geo.instY + 15, 24, white, 'left');
+    for (const [b, nm] of this.musicInstBtns) {
+      const chosen = p.inst === nm;
+      b.fill = chosen ? [59, 53, 96] : [42, 48, 66];
+    }
+
+    for (const [row, y] of geo.rows) {
+      if (row === null) {
+        text(g, 'EFFECTS', x0, y + 8, 20, 'rgb(165,173,194)', 'left');
+        g.strokeStyle = 'rgb(50,56,73)'; g.lineWidth = 1;
+        g.beginPath(); g.moveTo(x0 + 64, y + 8.5); g.lineTo(x0 + 660, y + 8.5); g.stroke();
+        continue;
+      }
+      const [label, key, fmt] = row;
+      const [lo, hi] = MUSIC.MUS_LIMITS[key];
+      const v = p[key];
+      text(g, label, x0, y + 12, 24, white, 'left');
+      const bx = x0 + 226, by = y + 6;
+      g.fillStyle = 'rgb(23,26,36)'; g.fillRect(bx, by, 200, 12);
+      g.fillStyle = 'rgb(108,140,255)'; g.fillRect(bx, by, Math.trunc(200 * (v - lo) / Math.max(1, hi - lo)), 12);
+      g.strokeStyle = 'rgb(58,65,86)'; g.lineWidth = 1; g.strokeRect(bx + 0.5, by + 0.5, 199, 11);
+      text(g, fmt(v, p), x0 + 474, y + 12, 24, '#fff', 'left', true);
+    }
+    // the chosen instrument gets its yellow frame on top of its button (drawn after the buttons below)
+    this._musicFrame = this.musicInstBtns.filter(([, nm]) => nm === p.inst).map(([b]) => b.rect);
+    this.musicScreenNotes().forEach((line, i) => text(g, line, cx, geo.endY + 52 + i * 26, 24, 'rgb(255,184,107)', 'center'));
+  }
+  drawNotification() {
+    const g = this.g;
+    const elapsed = this.now() - this.notificationTime;
+    const alpha = Math.max(0, 1 - elapsed / NOTE_MS);
+    g.font = `${Math.round(34 * FONT_K)}px ${FPS_FONT}`;
+    const tw = g.measureText(this.notification).width;
+    const w = tw + 28, h = Math.round(34 * FONT_K * 1.15) + 14;
+    const cx = this.WIDTH / 2, cy = this.HEIGHT - 25;
+    g.fillStyle = `rgba(0,0,0,${Math.min(alpha, 0.745)})`;
+    g.fillRect(cx - w / 2, cy - h / 2, w, h);
+    text(g, this.notification, cx, cy, 34, 'rgb(255,221,97)', 'center');
+  }
+}
+
+/* The yellow frame round the chosen instrument sits above its button, so draw it after the buttons. */
+const _drawGame = Game.prototype.draw;
+Game.prototype.draw = function () {
+  _drawGame.call(this);
+  if (this.mode === 'music' && this._musicFrame) {
+    for (const r of this._musicFrame) strokeInside(this.g, { x: r.x - 2, y: r.y - 2, w: r.w + 4, h: r.h + 4 }, 3, 'rgb(255,213,79)', 9);
+  }
+};
+
+/* ---------------------------------------------------------------- start */
+function startMahjong() {
+  const canvas = document.getElementById('c');
+  const game = new Game(canvas);
+  window.mahjong = game;
+  canvas.addEventListener('pointerdown', (e) => { e.preventDefault(); game.onPointerDown(e); });
+  window.addEventListener('pointermove', (e) => game.onPointerMove(e));
+  window.addEventListener('pointerup', (e) => game.onPointerUp(e));
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  canvas.addEventListener('wheel', (e) => { e.preventDefault(); game.onWheel(e); }, { passive: false });
+  window.addEventListener('keydown', (e) => { if (game.onKey(e)) e.preventDefault(); });
+  window.addEventListener('resize', () => game.resize());
+  document.addEventListener('visibilitychange', () => { game.mx = game.my = -1; });
+  const loop = () => { game.frame(); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+}
+window.addEventListener('load', startMahjong);
+</script></body></html>
