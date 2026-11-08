@@ -1,0 +1,13 @@
+/* The whole game is drawn on one full-window canvas (see js/ui.js). */
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #1e2d32;
+  overflow: hidden;
+}
+
+canvas {
+  display: block;
+  touch-action: none; /* the game handles pinch zoom and dragging itself */
+}
